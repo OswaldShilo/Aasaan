@@ -40,6 +40,7 @@ export const ICON = {
   edit: svg('<path d="M4 20h4L19 9l-4-4L4 16z"/>'),
   ext: svg('<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V7a1 1 0 011-1h5"/>'),
   left: svg('<path d="M15 6l-6 6 6 6"/>'),
+  expand: svg('<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>'),
   right: svg('<path d="M9 6l6 6-6 6"/>'),
   list: svg('<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>', 'stroke-width="2"'),
   graph: svg('<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7l3 9M16 7l-3 9"/>'),

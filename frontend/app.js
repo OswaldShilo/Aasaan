@@ -176,7 +176,9 @@ function wireMic(btn, onText, getLang) {
 // -------------------------------------------------------------------- workspace
 // After submit the student lands here at once: Course on the left (the whiteboard: it fills in live), chat on the right.
 const WS_DEFAULT = { w: 65, closed: false };
-const wsPrefs = (nid) => { try { return { ...WS_DEFAULT, ...JSON.parse(store.get("ws:" + nid) || "{}") }; } catch { return { ...WS_DEFAULT }; } };
+// first visit on a mid-size screen (861 to 1023 px): the chat starts collapsed, the whiteboard gets the room
+const wsDefault = () => ({ ...WS_DEFAULT, closed: innerWidth > 860 && innerWidth < 1024 });
+const wsPrefs = (nid) => { try { return { ...wsDefault(), ...JSON.parse(store.get("ws:" + nid) || "{}") }; } catch { return wsDefault(); } };
 const wsSave = (nid, p) => store.set("ws:" + nid, JSON.stringify(p));   // UI preference only: pane width and collapsed state
 
 async function workspace(nid, cid) {
@@ -187,8 +189,10 @@ async function workspace(nid, cid) {
   $app.innerHTML = `<div class="ws" id="ws" data-tab="course" data-view="${store.get("view:" + nid) || "course"}">
     <section class="board" id="board" aria-label="Course">
       <div class="board-top">
-        <div class="vseg" role="group" aria-label="Sections"><button id="vt-course" aria-pressed="true">Course</button><button id="vt-res" aria-pressed="false">Resources</button><span class="vsep" aria-hidden="true"></span><button id="vt-chat" aria-pressed="true" aria-keyshortcuts="Control+." title="Show or hide the chat (Ctrl+.)">Chat<i class="dot" id="chatdot" hidden></i></button></div>
+        <div class="vseg" role="group" aria-label="Sections"><button id="vt-course" aria-pressed="true">Course</button><button id="vt-res" aria-pressed="false">Resources</button></div>
+        <button class="focusbtn" id="focus" type="button" aria-pressed="false" aria-keyshortcuts="Control+\\" title="Focus: hide the chat (Ctrl+\\)">${ICON.expand}<span>Focus</span></button>
       </div>
+      <div class="board-scroll" id="boardscroll">
       <div id="courseview">
         <div class="nbhead"><div class="cover" id="cover"></div><div><h1 id="nbtitle"><span class="bar-s w60"></span></h1><p class="muted" id="nbdesc"></p></div><div class="ready" id="ready"></div></div>
         <div id="note"></div>
@@ -196,23 +200,25 @@ async function workspace(nid, cid) {
           <aside class="side" id="side" aria-label="Chapters"></aside><section class="main" id="main" aria-live="polite"></section></div>
       </div>
       <div id="resview" hidden></div>
+      </div>
     </section>
     <div class="divider" id="divider" role="separator" aria-orientation="vertical" aria-label="Resize the chat panel" tabindex="0" aria-valuemin="30" aria-valuemax="80" aria-valuenow="${prefs.w}"></div>
     <aside class="chatpane" id="chatpane" aria-label="Chat with Aasaan">
       <header class="chat-h"><span class="chat-name">${logoSvg("head-logo")} Aasaan</span>
-        <button class="iconbtn" id="dissolve" aria-label="Hide chat" aria-keyshortcuts="Control+." title="Hide chat (Ctrl+.)">${ICON.right}</button></header>
+        <button class="iconbtn" id="dissolve" aria-label="Collapse chat" aria-keyshortcuts="Control+\\" title="Collapse chat (Ctrl+\\)">${ICON.right}</button></header>
       <div class="msgs" id="msgs" role="log" aria-live="polite" aria-label="Conversation"></div>
       <button class="jump" id="jump" type="button" hidden>New messages ↓</button>
       <div class="chat-compose" id="chatcompose">
         <div class="suggest" id="suggest" aria-label="Suggestions"></div>
         <div class="ctxrow" id="ctxrow"></div><div class="att-row" id="chatatts"></div>
-        <div class="chat-input"><textarea id="chatinput" rows="1" placeholder="Ask about your course, or add a file or link…" aria-label="Message Aasaan"></textarea>
+        <div class="chat-input"><textarea id="chatinput" rows="2" placeholder="Ask about your course, or add a file or link…" aria-label="Message Aasaan"></textarea>
           <div class="toolbar"><button class="iconbtn" id="chatattach" type="button" aria-label="Attach files">${ICON.clip}</button>
             <button class="iconbtn" id="chatmic" type="button" aria-label="Speak your message">${ICON.mic}</button><span class="spacer"></span>
             <button class="send" id="chatsend" type="button" aria-label="Send" disabled>${ICON.up}</button></div></div>
         <input id="chatfile" type="file" aria-label="Choose files to send" accept="image/*,application/pdf,.txt,.md,text/plain" multiple hidden>
       </div>
     </aside>
+    <button class="chatfab" id="chatfab" type="button" aria-label="Open chat with Aasaan" aria-keyshortcuts="Control+\\" title="Open chat (Ctrl+\\)" hidden>${logoSvg()}<i class="dot" id="chatdot" hidden></i></button>
     <nav class="tabbar" id="tabbar" aria-label="Sections"><button data-tab="course" aria-current="true">Course</button><button data-tab="resources">Resources</button><button data-tab="chat">Chat<i class="dot" id="tabdot" hidden></i></button></nav>
   </div>`;
   wirePanes(nid);
@@ -261,19 +267,20 @@ function settleCourse(cid) {
 }
 
 function wirePanes(nid) {
-  const ws = document.getElementById("ws"), div = document.getElementById("divider"), pane = document.getElementById("chatpane"), chatBtn = document.getElementById("vt-chat");
+  const ws = document.getElementById("ws"), div = document.getElementById("divider"), pane = document.getElementById("chatpane"), chatBtn = document.getElementById("focus"), fab = document.getElementById("chatfab");
   const prefs = wsPrefs(nid);
   const apply = () => {
-    ws.style.setProperty("--board", prefs.w + "%");
+    ws.style.setProperty("--board", prefs.w + "%"); ws.style.setProperty("--chatw", (100 - prefs.w) + "%");
     ws.classList.toggle("chat-closed", prefs.closed);
-    pane.inert = prefs.closed && !matchMedia("(max-width: 860px)").matches; chatBtn.setAttribute("aria-pressed", String(!prefs.closed));
+    pane.inert = prefs.closed && !matchMedia("(max-width: 860px)").matches; chatBtn.setAttribute("aria-pressed", String(prefs.closed)); chatBtn.querySelector("span").textContent = prefs.closed ? "Show chat" : "Focus";
+    fab.hidden = !prefs.closed || matchMedia("(max-width: 860px)").matches;
     div.hidden = prefs.closed; div.setAttribute("aria-valuenow", String(Math.round(prefs.w)));
   };
   S.panes = { closed: () => prefs.closed, open: () => { if (matchMedia("(max-width: 860px)").matches) document.querySelector('#tabbar [data-tab="chat"]').click(); else setClosed(false); } };
-  const setClosed = (c) => { prefs.closed = c; wsSave(nid, prefs); apply(); if (c) chatBtn.focus(); else { document.getElementById("chatdot").hidden = true; (document.getElementById("chatinput") || pane).focus?.(); } };
+  const setClosed = (c) => { prefs.closed = c; wsSave(nid, prefs); apply(); if (c) fab.focus(); else { document.getElementById("chatdot").hidden = true; (document.getElementById("chatinput") || pane).focus?.(); } };
   const setW = (w) => { prefs.w = Math.max(30, Math.min(80, w)); wsSave(nid, prefs); apply(); };
   document.getElementById("dissolve").onclick = () => setClosed(true);
-  chatBtn.onclick = () => setClosed(!prefs.closed);
+  chatBtn.onclick = () => setClosed(!prefs.closed); fab.onclick = () => setClosed(false);
   div.onpointerdown = (e) => {
     e.preventDefault(); div.setPointerCapture(e.pointerId); ws.classList.add("dragging");
     const move = (ev) => { const r = ws.getBoundingClientRect(); setW(((ev.clientX - r.left) / r.width) * 100); };
@@ -285,7 +292,7 @@ function wirePanes(nid) {
     if (e.key === "ArrowLeft") { e.preventDefault(); setW(prefs.w - step); } else if (e.key === "ArrowRight") { e.preventDefault(); setW(prefs.w + step); }
     else if (e.key === "Home") { e.preventDefault(); setW(30); } else if (e.key === "End") { e.preventDefault(); setW(80); }
   };
-  const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === ".") { e.preventDefault(); setClosed(!prefs.closed); } };
+  const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && (e.key === "\\" || e.key === ".")) { e.preventDefault(); setClosed(!prefs.closed); } };
   if (S.keyHandler) document.removeEventListener("keydown", S.keyHandler);
   S.keyHandler = onKey; document.addEventListener("keydown", onKey);
   // Course | Resources
@@ -418,7 +425,7 @@ async function loadChapter(cid, keepScroll = false, auto = false) {
     if (ch.status !== "ready") api(`chapters/${cid}/prioritize`, {}).catch(() => {});  // jump the queue
     else if (!auto) api(`chapters/${cid}/open`, {}).catch(() => {});   // landing on a chapter automatically is not "starting" it
     renderSide(); renderChapter();
-    if (!keepScroll) document.getElementById("board")?.scrollTo({ top: document.querySelector(".nbhead")?.offsetHeight || 0, behavior: "smooth" });
+    if (!keepScroll) document.getElementById("boardscroll")?.scrollTo({ top: document.querySelector(".nbhead")?.offsetHeight || 0, behavior: "smooth" });
   } catch (e) { fail(e); }
 }
 

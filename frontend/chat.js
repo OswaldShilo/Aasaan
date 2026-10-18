@@ -128,7 +128,7 @@ export function createChat(ctx) {
   }
 
   // ------------------------------------------------------------------ composer
-  const autosize = () => { el.input.style.height = "auto"; el.input.style.height = Math.min(el.input.scrollHeight, 160) + "px"; };
+  const autosize = () => { el.input.style.height = "auto"; el.input.style.height = Math.min(el.input.scrollHeight, 150) + "px"; };
   function drawAtts() {
     el.atts.innerHTML = st.files.map((f, i) => `<span class="attchip"><span class="nm">${esc(f.name.slice(0, 30))}</span><span class="sz">${fmtSize(f.size)}</span>
       <button class="x" data-i="${i}" type="button" aria-label="Remove ${esc(f.name)}">×</button></span>`).join("");
