@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Optional
 
 from . import web
-from .agents import architect, companion, critic, curator, diagnoser, doubt, gates, illustrator, intake, quizzer, rewriter, teacher
+from .agents import architect, companion, critic, curator, diagnoser, doubt, gates, illustrator, intake, practice as practice_agent, quizzer, rewriter, slides as slides_agent, teacher
+from .agents.common import overlap, tokens
+from . import coverage, depth as depth_mod, readability, quiz_grading
+from .quiz_grading import correct_text
+from .orchestrator.decisions import DecisionEmitter
+from .orchestrator.referee import orchestrator_mode
+from .orchestrator.shadow import Shadow
+from .tools import current_notebook
 from .db import Store
 from . import edits
 from .tools import ToolRunner
@@ -82,7 +89,7 @@ def search_topic(nb: dict) -> str:
 
 
 class Engine:
-    def __init__(self, store: Store, router: ModelRouter, upload_dir: str | Path = "data/uploads",
+    def __init__(self, store: Store, router: ModelRouter, upload_dir: Optional[str | Path] = None,
                  retry_delay_s: float = 4.0, tools: Optional[ToolRunner] = None):
         self.store, self.router = store, router
         self.tools = tools
@@ -90,8 +97,58 @@ class Engine:
             web.set_runner(tools)
         web.set_page_gate(lambda url, title, text: gates.page_health(router, url, title, text))   # page_health after each fetch tier
         self.voice = Voice(router)
+        if upload_dir is None:
+            from .settings import get_uploads_dir
+            upload_dir = get_uploads_dir()
+        self.decisions = DecisionEmitter(store)
+        if getattr(router, "sink", None) is not None:
+            router.sink.hook = self._router_event
         self.upload_dir = Path(upload_dir)
         self.retry_delay_s = retry_delay_s
+
+    # ================================================================= orchestrator (shadow mode)
+    def _shadow(self, nid: str) -> Optional[Shadow]:
+        """The board mirror for this notebook when AASAAN_ORCHESTRATOR is on (or per-notebook and opted in), else None. The old build stays in charge."""
+        if orchestrator_mode() == "off":
+            return None
+        if getattr(self, "_shadow_obj", None) is None:
+            self._shadow_obj = Shadow(self.store, self.decisions)
+        return self._shadow_obj if self._shadow_obj.enabled(nid) else None
+
+    def _sh(self, nid: str, name: str, *a, **kw):
+        """Report a step to the board. A board problem is logged and ignored: observing must never fail a build."""
+        try:
+            sh = self._shadow(nid)
+            return getattr(sh, name)(nid, *a, **kw) if sh else None
+        except Exception as e:  # noqa: BLE001
+            self.router.note("referee", "fallback", f"board mirror skipped ({name})", f"{type(e).__name__}: {e}"[:150])
+            return None
+
+    # ================================================================= activity feed
+    def _dec(self, nid: str, agent: str, kind: str, what: str, **kw) -> None:
+        """One plain-language decision record for the learner's Activity feed. Never raises: the feed must not break a build."""
+        try:
+            self.decisions.emit(nid, agent, kind, what=what, **kw)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _FEED_AGENTS = {"intake": "intake", "architect": "architect", "curator": "curator", "teacher": "teacher", "critic": "critic", "quizzer": "quizzer",
+                    "illustrator": "illustrator", "doubt": "doubt", "editor": "editor", "diagnoser": "diagnoser", "rewriter": "rewriter", "scoper": "scoper"}
+
+    def _router_event(self, agent: str, provider: str, status: str, summary: str, error: str) -> None:
+        """A model or tool fell back, retried or failed: say so calmly. No model name, no raw error text: only a fixed reason."""
+        nid = current_notebook.get()
+        if not nid or status not in ("fallback", "retry", "failed"):
+            return
+        who = self._FEED_AGENTS.get(agent.split(":")[0].split(".")[0], "referee")
+        limit = bool(re.search(r"429|rate|quota|too many", error or "", re.I))
+        bucket = int(time.time() // 30)                                  # at most one record per agent and status every 30 s
+        self._dec(nid, who, "fell_back", "this step", reason_code="rate_limited" if limit else "backup_model", outcome="failed" if status == "failed" else "partial",
+                  severity="warning" if status == "failed" else "notice", dedupe_key=f"ev|{nid}|{who}|{status}|{bucket}")
+
+    def decisions_view(self, nid: str, since: int = 0, chapter_id: Optional[int] = None, agent: Optional[str] = None, severity: Optional[str] = None) -> dict:
+        self._nb(nid)
+        return {"decisions": self.decisions.recent(nid, since_id=since, chapter_id=chapter_id, agent=agent, severity=severity)}
 
     # ================================================================= helpers
     def profile(self, learner_id: str, nb: Optional[dict] = None) -> LearnerProfile:
@@ -111,9 +168,12 @@ class Engine:
             raise UserError("unknown chapter")
         return ch
 
-    def _all_chunks(self, nid: str) -> list[dict]:
+    def _all_chunks(self, nid: str, books: bool = False) -> list[dict]:
+        """Every chunk of the student's own material. Books are only for the chat to look things up in (books=True), never course input."""
         out = []
         for s in self.store.sources(nid):
+            if s["kind"] == "book" and not books:
+                continue
             for c in s["chunks"]:
                 out.append({**c, "source_id": s["id"]})
         return out
@@ -123,13 +183,13 @@ class Engine:
         by_id = {c["chunk_id"]: c for c in all_chunks}
         picked = [by_id[r] for r in ch.get("source_refs", []) if r in by_id][:8]
         if len(picked) < 3 and all_chunks:
-            words = set(re.findall(r"\w{4,}", (ch["title"] + " " + " ".join(ch.get("objectives", [])) + " " + ch.get("summary", "")).lower()))
+            words = tokens(ch["title"] + " " + " ".join(ch.get("objectives", [])) + " " + ch.get("summary", ""), 3)
             ranked = sorted((c for c in all_chunks if c not in picked),
-                            key=lambda c: -len(words & set(re.findall(r"\w{4,}", c["text"].lower()))))
+                            key=lambda c: -overlap(words, c["text"]))
             for c in ranked:
                 if len(picked) >= k:
                     break
-                if words & set(re.findall(r"\w{4,}", c["text"].lower())):
+                if overlap(words, c["text"]):
                     picked.append(c)
         return picked
 
@@ -247,7 +307,7 @@ class Engine:
         prof = self.profile(nb["learner_id"], nb)
         warnings: list[str] = []
         topics: list[dict] = []
-        srcs = self.store.sources(nid)[:MAX_SOURCES]
+        srcs = [s for s in self.store.sources(nid) if s["kind"] != "book"][:MAX_SOURCES]     # books are for the chat to look up, not course input
         if not srcs:
             self.say(nid, "Planning your course from your goal.", key="planning")
         for src in srcs:
@@ -274,6 +334,7 @@ class Engine:
         scope = gates.scoper(self.router, nb["goal"] or "", topics)
         if scope:
             self.router.note("scoper", "ok", f"scoped as {scope.get('track', '?')} / {scope.get('level', '?')}", f"decided by {scope['by']}")
+            self.store.cache_set(f"scope:{nid}", {k: scope.get(k) for k in ("track", "level")})
             if scope.get("level") and not nb.get("level"):
                 prof.level = scope["level"]
         res = architect.run(self.router, nb["goal"], topics, chunks, prof, nb["title"], (scope or {}).get("track"))
@@ -287,6 +348,10 @@ class Engine:
         self.store.update_notebook(nid, title=out.title[:80], description=out.description, level=out.level,
                                    goal=nb["goal"] or out.title)
         self.say(nid, f"The outline is ready: {len(out.chapters)} chapters. I'm writing chapter 1 first.", key="outline")
+        self._dec(nid, "architect", "planned", f"{len(out.chapters)} chapters", counts={"chapters": len(out.chapters)}, dedupe_key=f"outline|{nid}")
+        self._sh(nid, "outline", len(out.chapters))
+        self._check_coverage(nid, chunks)
+        self._source_books(nid, self._nb(nid))
 
     def _read_source(self, src: dict, nb: dict, warnings: list[str]) -> Optional[IntakeOut]:
         """Turn one source into chunks and topics. Text/PDF/URL chunking is code; photos go to the vision model."""
@@ -445,18 +510,25 @@ class Engine:
             return f"{b['type']}: {c.get('title', '')}"
         return ""
 
-    def _ref_chips(self, nid: str, refs: list[str], ch: Optional[dict]) -> list[dict]:
-        """Chips under an answer: the chapter it drew on, and the student's resources/pages it cited. Clicking one opens that place."""
-        chips, titles = [], {s["id"]: s["title"] for s in self.store.sources(nid)}
-        if ch:
+    def _ref_chips(self, nid: str, refs: list[str], ch: Optional[dict], order: Optional[list[str]] = None, web_chunks: Optional[dict] = None) -> list[dict]:
+        """Chips under an answer: the chapter it drew on, and the student's resources/pages it cited. Clicking one opens that place.
+        `order` is the chunk ids in the order the model saw them: a chip gets its number `n` so a [n] in the answer can link to it."""
+        srcs = self.store.sources(nid)
+        chips, titles = [], {s["id"]: s["title"] for s in srcs}
+        book_url = {s["id"]: s["raw_ref"] for s in srcs if s["kind"] == "book"}
+        if ch and not web_chunks:
             chips.append(self._chapter_ref(ch))
         page_chunks = {c["chunk_id"]: c for c in ((ch or {}).get("meta") or {}).get("page_chunks", [])}
+        page_chunks.update(web_chunks or {})
+        num = lambda r: {"n": order.index(r) + 1} if order and r in order else {}  # noqa: E731
         for r in refs:
             m = re.match(r"^(s[0-9a-f]+)-p(\d+)", r)
-            if m and m.group(1) in titles:
-                chips.append({"kind": "resource", "id": m.group(1), "label": f"{titles[m.group(1)][:36]} · p{m.group(2)}", "page": int(m.group(2))})
+            if m and m.group(1) in book_url:
+                chips.append({"kind": "link", "url": book_url[m.group(1)], "label": "Book · " + titles[m.group(1)][:34], **num(r)})
+            elif m and m.group(1) in titles:
+                chips.append({"kind": "resource", "id": m.group(1), "label": f"{titles[m.group(1)][:36]} · p{m.group(2)}", "page": int(m.group(2)), **num(r)})
             elif r in page_chunks:
-                chips.append({"kind": "link", "url": page_chunks[r].get("url", ""), "label": (page_chunks[r].get("title") or "web page")[:40]})
+                chips.append({"kind": "link", "url": page_chunks[r].get("url", ""), "label": (page_chunks[r].get("title") or "web page")[:40], **num(r)})
         seen, out = set(), []
         for c in chips:
             k = (c["kind"], c.get("id") or c.get("url"), c.get("page"))
@@ -465,19 +537,20 @@ class Engine:
                 out.append(c)
         return out[:5]
 
-    def chat_reply(self, nid: str, learner_id: str, text: str, chapter_id: Optional[int] = None, block_ids: Optional[list[int]] = None, style: str = "") -> dict:
+    def chat_reply(self, nid: str, learner_id: str, text: str, chapter_id: Optional[int] = None, block_ids: Optional[list[int]] = None, style: str = "",
+                   guide: bool = False) -> dict:
         """Answer a question about the notebook from its own sources and the chapter in focus. Returns {answer, refs}."""
         nb = self._nb(nid)
         prof = self.profile(learner_id, nb)
         chs = [c for c in self.store.chapters(nid)]
-        words = set(re.findall(r"\w{3,}", text.lower()))
+        words = tokens(text)
         ch = next((c for c in chs if c["id"] == chapter_id), None)
         if ch is None and chs:   # no chapter in focus: the one whose title and summary best match the question
-            score = lambda c: len(words & set(re.findall(r"\w{3,}", f"{c['title']} {c['summary']}".lower())))  # noqa: E731
+            score = lambda c: overlap(words, f"{c['title']} {c['summary']}")  # noqa: E731
             best = max((c for c in chs if c["status"] == "ready"), key=score, default=None)
             ch = best if best is not None and score(best) > 0 else None
-        pool = self._all_chunks(nid) + (((ch or {}).get("meta") or {}).get("page_chunks") or [])
-        pool.sort(key=lambda c: -len(words & set(re.findall(r"\w{3,}", c["text"].lower()))))
+        pool = self._all_chunks(nid, books=True) + (((ch or {}).get("meta") or {}).get("page_chunks") or [])
+        pool.sort(key=lambda c: -overlap(words, c["text"]))
         notes = ""
         if ch and ch["status"] == "ready":
             notes = next((b["content"].get("markdown", "") for b in self.store.blocks(ch["id"]) if b["type"] == "notes"), "")
@@ -488,12 +561,100 @@ class Engine:
                 ctx_parts.append(self._block_text(b)[:1500])
         if ctx_parts:
             notes = "The student is asking about this part of the course:\n" + "\n".join(ctx_parts) + "\n\n" + notes
+        history = self._recent_turns(nid, text)
+        used = pool[:6]
         with self._scope(nid):
-            res = doubt.run(self.router, text, pool[:6], prof, notes, style)
-        return {"answer": res.value.answer, "refs": self._ref_chips(nid, res.value.source_refs, ch)}
+            res = doubt.run(self.router, text, used, prof, notes, style, history=history, guide=guide)
+            out = res.value
+            if not out.covered and not ctx_parts:        # the notebook cannot answer: look it up, say so, and cite what was found
+                web_pool = self._web_lookup(nb, text)
+                if web_pool:
+                    r2 = doubt.run(self.router, text, web_pool, prof, "", style, history=history, external=True, guide=guide)
+                    by = {c["chunk_id"]: c for c in web_pool}
+                    return {"answer": "That isn't in your notebook, so I looked it up online: " + r2.value.answer,
+                            "refs": self._ref_chips(nid, r2.value.source_refs or [web_pool[0]["chunk_id"]], None, [c["chunk_id"] for c in web_pool], by)}
+                return {"answer": out.answer + "\n\n(That isn't covered in your notebook, and I couldn't look it up online right now.)",
+                        "refs": self._ref_chips(nid, out.source_refs, ch, [c["chunk_id"] for c in used])}
+        quote = f"\n\nFrom the source: “{out.quote[:300]}”" if out.quote else ""
+        return {"answer": out.answer + quote,
+                "refs": self._ref_chips(nid, out.source_refs, ch, [c["chunk_id"] for c in used])}
+
+    def _check_coverage(self, nid: str, chunks: list[dict]) -> Optional[dict]:
+        """If the learner gave a contents list or syllabus, say whether every item maps to a chapter (and which do not). Also reports structural problems."""
+        try:
+            chs = self.store.chapters(nid)
+            for problem in coverage.validate_outline(chs):
+                self.router.note("architect", "fallback", "outline check", problem)
+            items = coverage.checklist_from_chunks(chunks)
+            if not items:
+                return None
+            cov = coverage.coverage_map(items, chs)
+            self.store.cache_set(f"coverage:{nid}", {**cov, "items": items})
+            gaps = cov["gaps"]
+            if gaps:
+                self.say(nid, f"{len(gaps)} item{'s' if len(gaps) != 1 else ''} in your contents list {'are' if len(gaps) != 1 else 'is'} not covered by a chapter yet: "
+                              + "; ".join(g[:40] for g in gaps[:3]) + ("…" if len(gaps) > 3 else "") + ".", key="coverage")
+            else:
+                self.say(nid, f"Every one of the {len(items)} items in your contents list is covered by a chapter.", key="coverage")
+            return cov
+        except Exception as e:  # noqa: BLE001  a check must never fail the notebook
+            self.router.note("architect", "fallback", "coverage check failed", f"{type(e).__name__}: {e}"[:150])
+            return None
+
+    def _source_books(self, nid: str, nb: dict) -> int:
+        """Find real books on the topic (Open Library) and keep them as a resource the chat can look things up in, cited as [n] with a link.
+        Best effort: no books (offline, nothing found) just means no books; it never fails the notebook."""
+        if os.environ.get("AASAAN_BOOKS", "on").strip().lower() in ("off", "0", "false", "no") or any(s["kind"] == "book" for s in self.store.sources(nid)):
+            return 0
+        try:
+            topic = search_topic(nb)
+            books = web.discover_books(topic, 5)
+        except Exception as e:  # noqa: BLE001
+            self.router.note("books", "fallback", "book search failed", f"{type(e).__name__}: {e}"[:150])
+            return 0
+        for b in books:
+            x = b.extra
+            by = ", ".join(x.get("authors") or [])
+            text = " ".join(p for p in [f"{b.title}" + (f" by {by}" if by else "") + (f" ({x['year']})." if x.get("year") else "."),
+                                        f"Topics: {', '.join(x['subjects'])}." if x.get("subjects") else "", f"Opens: \"{x['first_sentence']}\"" if x.get("first_sentence") else "",
+                                        "Can be read online through the Internet Archive." if x.get("ia") else ""] if p)
+            sid = self.store.add_source(nid, "book", b.url, b.title, text, [])
+            self.store.update_source_chunks(sid, [{"chunk_id": f"{sid}-p1-c1", "page": 1, "text": text}])
+            self.store.set_source_meta(sid, {"status": "ready", "authors": x.get("authors"), "year": x.get("year"), "ia": x.get("ia")})
+        if books:
+            self.say(nid, f"I also found {len(books)} book{'s' if len(books) != 1 else ''} on {search_topic(nb)[:40]} that the chat can look things up in.", key="books",
+                     refs=[{"kind": "link", "url": b.url, "label": b.title[:40]} for b in books[:3]])
+        return len(books)
+
+    def _recent_turns(self, nid: str, current: str, limit: int = 8) -> list[dict]:
+        """The last few chat turns (not narration, not proposals), oldest first, so a follow-up like "explain that again" has something to point at."""
+        msgs = [m for m in self.store.messages(nid, max(0, self.store.last_message_id(nid) - 40)) if m["kind"] == "chat" and m["content"]]
+        if msgs and msgs[-1]["role"] == "user" and msgs[-1]["content"].strip() == current.strip():
+            msgs = msgs[:-1]                                    # the question being answered is already stored; it is not history
+        return [{"role": m["role"], "text": m["content"][:500]} for m in msgs[-limit:]]
+
+    def _web_lookup(self, nb: dict, question: str) -> list[dict]:
+        """Up to 2 web pages about the question, as chunks w1, w2. The search query is the notebook's subject plus a few keywords,
+        never the learner's whole message. Any failure means no pages (the caller says so)."""
+        try:
+            q = (search_topic(nb) + " " + " ".join(sorted(tokens(question, 3))[:5])).strip()
+            cands = web.discover_wikipedia(q, 3)
+            if os.environ.get("FIRECRAWL_API_KEY"):
+                cands += web.discover_firecrawl(q, 3)
+            out: list[dict] = []
+            for c in cands:
+                page = web.fetch_page(c.url, self.store)
+                if page.ok and page.text:
+                    out.append({"chunk_id": f"w{len(out) + 1}", "text": page.text[:1200], "url": c.url, "title": page.title or c.title})
+                if len(out) >= 2:
+                    break
+            return out
+        except Exception as e:  # noqa: BLE001
+            self.router.note("doubt", "fallback", "online lookup failed", f"{type(e).__name__}: {e}"[:150])
+            return []
 
     # ---- one chat turn: what does the student want, and do it
-    def handle_chat(self, nid: str, learner_id: str, question: str, chapter_id: Optional[int] = None, block_ids: Optional[list[int]] = None) -> dict:
+    def handle_chat(self, nid: str, learner_id: str, question: str, chapter_id: Optional[int] = None, block_ids: Optional[list[int]] = None, mode: str = "answer") -> dict:
         """{"type": "text", "text", "refs"} (stored by the caller) or {"type": "proposal", ...} (already stored as a chat card)."""
         chs = self.store.chapters(nid)
         intent = gates.route_intent(self.router, question, {"message": question[:500], "chapters": [c["title"] for c in chs][:25]})
@@ -516,18 +677,18 @@ class Engine:
             if p is None:
                 return {"type": "text", "refs": [], "text": "I couldn't turn that into a change to the course. Try something like \"add a chapter on Delta Lake after chapter 5\"."}
             return {"type": "proposal", "proposal": p}
-        out = self.chat_reply(nid, learner_id, question, chapter_id, block_ids, style="explain" if kind == "explain" else "")
+        out = self.chat_reply(nid, learner_id, question, chapter_id, block_ids, style="explain" if kind == "explain" else "", guide=(mode == "guide"))
         return {"type": "text", "text": out["answer"], "refs": out["refs"]}
 
     @staticmethod
     def _focus_chapter(chs: list[dict], text: str, chapter_id: Optional[int]) -> Optional[dict]:
         ch = next((c for c in chs if c["id"] == chapter_id), None)
-        words = set(re.findall(r"\w{3,}", text.lower()))
+        words = tokens(text)
         m = re.search(r"chapter\s+(\d+)", text.lower())
         if m:
             ch = next((c for c in chs if c["position"] == int(m.group(1))), ch)
         elif ch is None:
-            score = lambda c: len(words & set(re.findall(r"\w{3,}", f"{c['title']} {c['summary']}".lower())))  # noqa: E731
+            score = lambda c: overlap(words, f"{c['title']} {c['summary']}")  # noqa: E731
             ch = max(chs, key=score, default=None)
         return ch
 
@@ -706,9 +867,13 @@ class Engine:
         self._nb(nid)
         chs = self.store.chapters(nid)
         notes_refs = self._notes_refs(chs)
-        mine = []
+        mine, books = [], []
         for s in self.store.sources(nid):
             meta = s.get("meta") or {}
+            if s["kind"] == "book":
+                books.append({"kind": "book", "title": s["title"], "source": "openlibrary.org" + (" · " + ", ".join(meta["authors"][:2]) if meta.get("authors") else ""),
+                              "url": s["raw_ref"], "license": "", "author": str(meta.get("year") or ""), "used_in": []})
+                continue
             kind = s["kind"]
             size = meta.get("size") or len(s.get("extracted_text") or "") if kind == "text" else meta.get("size", 0)
             mine.append({"id": s["id"], "kind": "pasted" if (kind == "text" and s["raw_ref"] == "pasted") else kind, "title": s["title"],
@@ -739,7 +904,7 @@ class Engine:
                     continue
                 cur = found.setdefault(key, {**item, "used_in": []})
                 cur["used_in"].append({"id": ch["id"], "position": ch["position"], "title": ch["title"][:60]})
-        return {"mine": mine, "found": list(found.values())}
+        return {"mine": mine, "found": list(found.values()) + books}
 
     def resource_impact(self, nid: str, sid: str) -> dict:
         chs = self.store.chapters(nid)
@@ -815,28 +980,38 @@ class Engine:
         own = self._chapter_chunks(ch, all_chunks)
 
         res = curator.curate(self.router, self.store, ch["title"], ch["objectives"], search_topic(nb), nb["language"])
+        self._dec(nb["id"], "curator", "chose", f"resources for chapter {ch['position']}", chapter_id=cid,
+                  counts={"videos": len(res.videos), "links": len(res.links), "images": len(res.images)}, dedupe_key=f"curate|{cid}|{int(time.time() // 5)}")
         page_chunks = [{"chunk_id": p["chunk_id"], "page": 1, "text": p["text"], "source_id": "web"} for p in res.pages]
         chunks = own + page_chunks
         link_refs = [{"ref": f"url:{c.url}", "title": c.title, "source": c.source, "kind": c.kind} for c in res.links + res.videos]
         allowed_extra = {l["ref"] for l in link_refs}
 
         issues, previous, content, verified, revisions, open_points = None, None, None, False, 0, []
+        claims_total = claims_flagged = None
         quiz_future = None
+        dprof = depth_mod.profile(self.store, nb["id"])
+        self._sh(nb["id"], "chapter_start", cid, ch["position"])
         with ThreadPoolExecutor(max_workers=2) as pool:
             for attempt in range(MAX_REVISIONS + 1):
-                content = teacher.run(self.router, ch, chunks, link_refs, prof, issues, previous, self.store).value
+                content = teacher.run(self.router, ch, chunks, link_refs, prof, issues, previous, self.store, depth=dprof).value
+                self._sh(nb["id"], "draft", cid)
                 self.store.set_chapter_status(cid, "checking")
                 # the quiz is written while the Critic checks this draft (saves a full round trip on the happy path)
                 quiz_future = pool.submit(quizzer.run, self.router, ch, content, chunks, prof, self.store)
                 review: CriticOut = critic.run(self.router, content, chunks, prof, allowed_extra).value
+                claims_total, claims_flagged = review.claims_total, review.claims_flagged
                 if review.verdict == "approve":
                     verified = True
+                    self._sh(nb["id"], "approved", cid, True)
                     break
                 open_points = [i.model_dump() for i in review.issues]
                 if attempt == MAX_REVISIONS:
                     self.router.note("critic", "fallback", f"Chapter '{ch['title'][:40]}' shipped unverified",
                                      f"Critic still had {len(review.issues)} issue(s) after {MAX_REVISIONS} revisions")
+                    self._sh(nb["id"], "approved", cid, False)
                     break
+                self._sh(nb["id"], "fixes", cid, len(review.issues))
                 revisions += 1
                 issues = [i.model_dump() for i in review.issues]
                 previous = content.model_dump()
@@ -846,6 +1021,14 @@ class Engine:
             illo_pool = ThreadPoolExecutor(max_workers=1)
             illo_future = illo_pool.submit(contextvars.copy_context().run, illustrator.run, self.router, self.store, ch["title"],
                                            content.notes_md, prof.language)
+            scope_ = self.store.cache_get(f"scope:{nb['id']}") or {}
+            practice_future = slides_pool_ = None
+            if scope_.get("track") in ("dsa", "exam") and os.environ.get("AASAAN_PRACTICE", "on").strip().lower() not in ("off", "0", "false", "no"):
+                slides_pool_ = ThreadPoolExecutor(max_workers=1)
+                practice_future = slides_pool_.submit(contextvars.copy_context().run, practice_agent.practice_for, scope_.get("track"), ch["title"], prof.level, nb["goal"] or "")
+            slides_pool = ThreadPoolExecutor(max_workers=1)        # the deck is written from the FINAL notes, beside the quiz and visuals; it can only add, never block
+            slides_future = None if os.environ.get("AASAAN_SLIDES", "on").strip().lower() in ("off", "0", "false", "no") else slides_pool.submit(
+                contextvars.copy_context().run, slides_agent.run, self.router, ch, content, prof, dprof)
             quiz: QuizOut = quiz_future.result().value  # the quiz of the FINAL draft (earlier drafts' quizzes are discarded)
             quiz, quiz_notes = gates.quiz_sanity(self.router, quiz, content.notes_md)
             for n in quiz_notes:
@@ -858,10 +1041,43 @@ class Engine:
         except Exception as e:  # noqa: BLE001
             self.router.note("illustrator", "failed", "Illustrator failed; chapter ships without visuals", f"{type(e).__name__}: {e}")
         illo_pool.shutdown(wait=False, cancel_futures=True)
+        practice_content = None
+        if practice_future is not None:
+            try:
+                practice_content = practice_future.result(timeout=float(os.environ.get("AASAAN_PRACTICE_TIMEOUT_S", "15")))
+            except Exception:  # noqa: BLE001  practice is a bonus: a timeout or failure means no practice block
+                practice_content = None
+            slides_pool_.shutdown(wait=False, cancel_futures=True)
+            if practice_content:
+                self._dec(nb["id"], "practice", "chose", f"{len(practice_content['items'])} practice items", chapter_id=cid, counts={"items": len(practice_content["items"])},
+                          dedupe_key=f"practice|{cid}|{int(time.time() // 5)}")
+        deck_cards = None
+        if slides_future is not None:
+            try:
+                deck_cards = [c.model_dump() for c in slides_future.result(timeout=float(os.environ.get("AASAAN_SLIDES_TIMEOUT_S", "90"))).value.slides]
+                self._dec(nb["id"], "slides", "accepted", f"{len(deck_cards)} slides", chapter_id=cid, counts={"slides": len(deck_cards)}, dedupe_key=f"slides|{cid}|{int(time.time() // 5)}")
+            except FutureTimeout:
+                self.router.note("slides", "failed", "slides timed out; the Teacher's own slides are used", "AASAAN_SLIDES_TIMEOUT_S exceeded")
+            except Exception as e:  # noqa: BLE001
+                self.router.note("slides", "failed", "slides failed; the Teacher's own slides are used", f"{type(e).__name__}: {e}"[:150])
+            slides_pool.shutdown(wait=False, cancel_futures=True)
 
+        notes_clean, read_meta = readability.clean_notes(content.notes_md, ch["title"])
+        if depth_mod.needs_expansion(notes_clean, dprof) and self.router.fake is None and not os.environ.get("AASAAN_NO_EXPAND"):
+            try:                                                   # one expansion pass: add examples, an edge case, a common mistake; then it is re-checked by size only
+                longer = teacher.run(self.router, ch, chunks, link_refs, prof, [{"step": 0, "problem": f"The notes are too short ({read_meta['words']} words; about "
+                                                                                    f"{dprof['words']} are needed). Add worked examples, an edge case and a common mistake."}],
+                                     content.model_dump(), self.store, depth=dprof).value
+                n2, m2 = readability.clean_notes(longer.notes_md, ch["title"])
+                if m2["words"] > read_meta["words"]:
+                    content, notes_clean, read_meta = longer, n2, m2
+                    self._dec(nb["id"], "teacher", "expanded", f"chapter {ch['position']}", chapter_id=cid, counts={"words": m2["words"]}, reason_code="too_short",
+                              dedupe_key=f"expand|{cid}|{int(time.time() // 5)}")
+            except Exception as e:  # noqa: BLE001  an expansion is a bonus, never a failure
+                self.router.note("teacher", "fallback", f"expansion of '{ch['title'][:40]}' skipped", f"{type(e).__name__}: {e}"[:150])
         blocks = [
-            {"type": "notes", "content": {"markdown": content.notes_md}, "meta": {"refs": content.source_refs}},
-            {"type": "slides", "content": {"cards": [s.model_dump(exclude={"image_query"}) for s in content.slides]}},
+            {"type": "notes", "content": {"markdown": notes_clean}, "meta": {"refs": content.source_refs}},
+            {"type": "slides", "content": {"cards": deck_cards or [s.model_dump(exclude={"image_query"}) for s in content.slides]}},
         ]
         blocks[1:1] = visuals   # pictures sit right after the notes they illustrate
         for v in res.videos:
@@ -873,12 +1089,27 @@ class Engine:
                                                                   "source": im.source, "page_url": im.extra.get("page_url", "")}}})
         for ln in res.links:
             blocks.append({"type": "link", "verified": True, "content": {"url": ln.url, "title": ln.title, "source": ln.source, "reason": ln.reason}})
+        if practice_content:
+            blocks.append({"type": "practice", "verified": True, "content": practice_content})
         blocks.append({"type": "quiz", "content": {"questions": [q.model_dump() for q in quiz.questions]}})
         blocks.append({"type": "summary", "content": {"text": content.summary, "key_points": content.key_points}})
-        meta = {**ch["meta"], "unverified": not verified, "grounded": bool(chunks), "revisions": revisions,
+        meta = {**ch["meta"], "unverified": not verified, "grounded": bool(chunks), "revisions": revisions, "readability": read_meta, "depth": dprof["name"],
+                "claims": ({"total": claims_total, "verified": claims_total - (0 if verified else (claims_flagged or 0))} if claims_total is not None else None),
+                "common_mistakes": content.common_mistakes,
                 "page_chunks": page_chunks, "curator_notes": res.notes,
                 "review_issues": [] if verified else self._claim_rows(open_points, chunks, allowed_extra)}
         self.store.replace_blocks(cid, blocks, "ready", meta)
+        nid_ = nb["id"]
+        self._sh(nid_, "outputs_ready", cid)
+        self._dec(nid_, "teacher", "accepted", f"notes for chapter {ch['position']}", chapter_id=cid, counts={"words": len(content.notes_md.split())},
+                  dedupe_key=f"notes|{cid}|{int(time.time() // 5)}")
+        if revisions:
+            self._dec(nid_, "critic", "fixed", f"chapter {ch['position']}", chapter_id=cid, counts={"revisions": revisions}, reason_text="the Critic sent claims back to the Teacher",
+                      dedupe_key=f"fix|{cid}|{int(time.time() // 5)}")
+        self._dec(nid_, "critic", "accepted" if verified else "stopped", f"chapter {ch['position']}" + ("" if verified else " as unverified"), chapter_id=cid,
+                  reason_code=None if verified else "loop_limit", outcome="ok" if verified else "partial", severity="info" if verified else "notice",
+                  dedupe_key=f"verdict|{cid}|{int(time.time() // 5)}")
+        self._dec(nid_, "quizzer", "accepted", f"{len(quiz.questions)} quiz questions", chapter_id=cid, counts={"questions": len(quiz.questions)}, dedupe_key=f"quiz|{cid}|{int(time.time() // 5)}")
         self._announce_chapter(ch, verified)
         if verified:
             self.store.cache_set(teacher.content_cache_key(ch, prof.language), content.model_dump())
@@ -1017,7 +1248,7 @@ class Engine:
                 "preparing": {"ready": sum(1 for c in chs if c["status"] == "ready"), "total": len(chs),
                               "pct": round(100 * sum(1 for c in chs if c["status"] == "ready") / len(chs)) if chs else 0,
                               "complete": bool(chs) and all(c["status"] == "ready" for c in chs)},
-                "progress": {"done": done, "total": len(chs)}, "message_seq": self.store.last_message_id(nid), **edits.snapshot_info(self.store, nid), "warnings": [w for w in (self.store.cache_get(f"nbwarn:{nid}") or []) if not re.match(r"page \d+ unreadable or empty$", w)],
+                "progress": {"done": done, "total": len(chs)}, "message_seq": self.store.last_message_id(nid), "decision_seq": self.decisions.last_id(nid), **edits.snapshot_info(self.store, nid), "warnings": [w for w in (self.store.cache_get(f"nbwarn:{nid}") or []) if not re.match(r"page \d+ unreadable or empty$", w)],
                 "source_issues": [{"source_id": s["id"], "title": s["title"], "status": s["meta"].get("status", "ready"), "pages_total": s["meta"].get("pages_total"),
                                    "pages_read": s["meta"].get("pages_read"), "issues": s["meta"].get("issues", [])}
                                   for s in self.store.sources(nid) if (s["meta"] or {}).get("issues")],
@@ -1059,7 +1290,8 @@ class Engine:
         return {"id": cid, "notebook_id": nb["id"], "title": ch["title"], "summary": ch["summary"], "objectives": ch["objectives"],
                 "status": ch["status"], "state": self._state(ch), "learning": self._learning(ch), "generation": self._generation(ch),
                 "kind": ch["kind"], "error": ch["error"], "review_issues": meta.get("review_issues", []),
-                "blocks": out_blocks, "unverified": bool(meta.get("unverified")), "grounded": meta.get("grounded", True),
+                "blocks": out_blocks, "unverified": bool(meta.get("unverified")), "grounded": meta.get("grounded", True), "claims": meta.get("claims"),
+                "patched_blocks": meta.get("patched_blocks", []),
                 "curator_notes": meta.get("curator_notes", []), "completed": ch["completed"]}
 
     def open_chapter(self, cid: int) -> None:
@@ -1090,8 +1322,39 @@ class Engine:
         # The greeting is fixed text chosen by code from stored memory. A model never writes it, so it can never claim a history the student
         # does not have ("welcome back" on a first session). Opening the app opens a session each time, so "returning" means real history.
         first = not self.store.has_history(learner_id)
-        return {"message": self.greeting(first, nb["title"], prof.mistake_labels, self.store.last_summary(learner_id)),
-                "suggested_next": nxt, "mistake_labels": prof.mistake_labels, "is_first_session": first}
+        review = {} if first else self.review_summary(learner_id, nid)
+        msg = self.greeting(first, nb["title"], prof.mistake_labels, self.store.last_summary(learner_id))
+        if review.get("available"):                                  # built from stored mastery and mistakes only, never invented
+            msg += f" Want a {review['minutes']}-minute review of {', '.join(review['topics'][:2])}?"
+        return {"message": msg, "suggested_next": nxt, "mistake_labels": prof.mistake_labels, "is_first_session": first, "review": review}
+
+    REVIEW_BELOW = 70            # mastery under this percent is worth a review
+    REVIEW_MINUTES, REVIEW_QUESTIONS = 5, 5
+
+    def review_items(self, learner_id: str, nid: str) -> list[dict]:
+        """A short spaced review: questions on the concepts this learner is weakest at, from this notebook's own quizzes. Lowest mastery first."""
+        self._nb(nid)
+        mastery = self.store.memory_kind(learner_id, "mastery")
+        weak = {c: v["pct"] for c, v in mastery.items() if isinstance(v, dict) and v.get("pct", 100) < self.REVIEW_BELOW}
+        labels = {l.lower() for l in self.store.mistake_labels(learner_id)}
+        pool = []
+        for ch in self.store.chapters(nid):
+            qb = next((b for b in self.store.blocks(ch["id"]) if b["type"] == "quiz"), None) if ch["status"] == "ready" else None
+            for q in (qb["content"]["questions"] if qb else []):
+                key = q.get("objective") if q.get("objective") in weak else q.get("concept")
+                if key in weak or str(q.get("concept", "")).lower() in labels:
+                    pool.append({**q, "chapter_id": ch["id"], "_rank": weak.get(key, 60)})
+        pool.sort(key=lambda q: q["_rank"])
+        out = []
+        for q in pool[:self.REVIEW_QUESTIONS]:
+            q.pop("_rank", None)
+            out.append(q)
+        return out
+
+    def review_summary(self, learner_id: str, nid: str) -> dict:
+        items = self.review_items(learner_id, nid)
+        topics = list(dict.fromkeys(q.get("objective") or q.get("concept") for q in items))
+        return {"available": bool(items), "minutes": self.REVIEW_MINUTES, "topics": [t for t in topics if t][:3], "count": len(items)}
 
     @staticmethod
     def greeting(first_session: bool, title: str, labels: list[str], last_summary: Optional[str]) -> str:
@@ -1123,6 +1386,14 @@ class Engine:
         self.store.close_session(session_id, out.message)
         return {"message": out.message, "suggested_next": out.suggested_next, "revisit": wrong}
 
+    def scope_view(self, nid: str) -> dict:
+        nb = self._nb(nid)
+        return {"depth": depth_mod.name_for(self.store, nid), "level": nb["level"] or "beginner", "language": nb["language"],
+                "track": (self.store.cache_get(f"scope:{nid}") or {}).get("track", "general"), "depths": list(depth_mod.PROFILES), "levels": ["beginner", "intermediate", "advanced"]}
+
+    def propose_scope(self, nid: str, depth: Optional[str] = None, level: Optional[str] = None) -> Optional[dict]:
+        return edits.propose_scope(self, nid, depth, level)
+
     # ================================================================== quiz
     def answer(self, learner_id: str, session_id: str, cid: int, question_id: str, student_answer: str, attempt: int = 1) -> dict:
         ch = self._chapter(cid)
@@ -1147,7 +1418,8 @@ class Engine:
         out = {"question_id": question_id, "follow_up": False, "result": d.result, "misconception": d.misconception,
                "hint": d.hint or q.hint, "confidence": d.confidence}
         if d.result == "correct" or attempt >= 2:  # hint first; reveal the answer only after a second try
-            out["correct_answer"] = resolve_key(q)
+            out["correct_answer"] = correct_text(q)
+            out["explanation"] = q.explanation
         return out
 
     def finish_chapter(self, learner_id: str, session_id: str, cid: int) -> dict:
@@ -1174,7 +1446,7 @@ class Engine:
         if not wrong and ch["kind"] == "review" and ch["prereqs"]:  # a passed review clears its parent's flag
             self.store.update_chapter(ch["prereqs"][0], needs_review=False)
 
-        added, reason = [], "Course unchanged."
+        added, proposed, reason = [], [], "Course unchanged."
         if wrong and ch["kind"] != "review":
             made = [c for c in self.store.chapters(nid) if c["kind"] == "review" and c["meta"].get("session") == session_id]
             left = MAX_INSERTS_PER_SESSION - len(made)
@@ -1182,16 +1454,22 @@ class Engine:
                 chs = [{"id": c["id"], "title": c["title"], "position": c["position"], "kind": c["kind"]} for c in self.store.chapters(nid)]
                 rw = rewriter.run(self.router, chs, cid, wrong, self.store.mistake_counts(learner_id), left).value
                 reason = rw.reason or reason
-                for ins in rw.patch.insert[:left]:
-                    after = self._chapter(int(ins.after))
-                    self.store.shift_positions(nid, after["position"], 1)
-                    new_id = self.store.add_chapter(nid, after["position"] + 1, ins.title, ins.summary, ins.objectives, [after["id"]],
-                                                    after["source_refs"], kind="review", priority=80,
-                                                    meta={"session": session_id, "misconception": wrong[0]["misconception"]})
-                    self.store.add_job(nid, new_id, "chapter")
-                    added.append({"id": new_id, "title": ins.title})
+                inserts = [ins.model_dump() for ins in rw.patch.insert[:left]]
+                prop = edits.propose_review(self, nid, session_id, cid, inserts, wrong[0]["misconception"]) if inserts else None
+                if prop:                                    # the Rewriter PROPOSES: the course changes only when the learner applies the card
+                    proposed.append({"id": prop["id"], "summary": prop["summary"]})
+                    reason = "I suggested a short review. Apply it from the chat when you like."
         self._refresh_status(nid)
-        return {"score": {"correct": correct, "total": total}, "added": added, "reason": reason,
+        qblock = next((b for b in self.store.blocks(cid) if b["type"] == "quiz"), None)
+        marks = quiz_grading.mark(rows, qblock["content"]["questions"]) if qblock else None
+        if marks:
+            for row in marks["by_concept"]:                              # mastery per concept: a running average the Diagnoser and Rewriter can read
+                old = self.store.get_memory(learner_id, "mastery", row["concept"], {"pct": row["percent"], "n": 0})
+                n = int(old.get("n", 0)) + 1
+                self.store.set_memory(learner_id, "mastery", row["concept"], {"pct": round((old["pct"] * (n - 1) + row["percent"]) / n), "n": n})
+            if marks["passed"] and not wrong:
+                self.store.update_chapter(cid, completed=True)
+        return {"score": {"correct": correct, "total": total}, "marks": marks, "added": added, "proposed": proposed, "reason": reason,
                 "revisit": [w["misconception"] for w in wrong], "notebook": self.notebook_view(nid)}
 
     # ================================================================ doubts
@@ -1206,8 +1484,8 @@ class Engine:
         if not text or not text.strip():
             raise UserError("empty question")
         pool = self._chapter_chunks(ch, self._all_chunks(nb["id"])) + (ch["meta"].get("page_chunks") or [])
-        words = set(re.findall(r"\w+", text.lower()))
-        pool.sort(key=lambda c: -len(words & set(re.findall(r"\w+", c["text"].lower()))))
+        words = tokens(text)
+        pool.sort(key=lambda c: -overlap(words, c["text"]))
         notes = next((b["content"].get("markdown", "") for b in self.store.blocks(cid) if b["type"] == "notes"), "")
         res = doubt.run(self.router, text, pool[:6], prof, notes)
         audio_out = self.voice.tts(res.value.answer, prof.language)

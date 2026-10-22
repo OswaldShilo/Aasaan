@@ -1,15 +1,50 @@
+# Version control
 .git
+.gitignore
+
+# Environment files and credentials
 .env
+.env*
+env
+env*
+*.env
+
+# Python caches, bytecode, and virtual environments
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache
+.coverage
+htmlcov
+venv/
+.venv/
+ENV/
+env/
+
+# IDEs and editors
+.vscode
+.idea
+*.swp
+*.swo
+
+# Node modules
+node_modules/
+
+# Markdown documentation (except README.md)
+*.md
+!README.md
+
+# Tests and testing artifacts
+backend/tests
+tests
+eval
+
+# Runtime data, backups, and logs
 data
 backups
-__pycache__
-*.pyc
-.pytest_cache
 build-log
-eval
 scripts
 samples
 architecture
 agents
-PRD.md
-backend/tests

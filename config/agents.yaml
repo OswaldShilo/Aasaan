@@ -1,0 +1,22 @@
+# Agent manifests for the orchestrator (Milestone 4). Declarative: the referee reads these, agents never read each other's code.
+#   needs          artifact types that must exist (approved or released) before a task for this agent becomes ready
+#   produces       artifact types this agent writes
+#   may_request    peers it may message (NeedHelp / Clarify / Fixes); anything else is refused
+#   release_gate   what the referee checks before releasing the artifact: none | verified | quality | proposal (never auto-released)
+#   concurrency    simultaneous tasks for this role; timeout_s and max_retries bound one task
+agents:
+  intake:      { layer: 1, model_role: intake,    needs: [],             produces: [source_pack],                       may_request: [],                    concurrency: 1, timeout_s: 120, max_retries: 1, release_gate: none }
+  scoper:      { layer: 4, model_role: editor,    needs: [source_pack],  produces: [scope],                             may_request: [],                    concurrency: 1, timeout_s: 30,  max_retries: 1, release_gate: none }
+  architect:   { layer: 2, model_role: architect, needs: [source_pack],  produces: [outline],                           may_request: [intake, critic],      concurrency: 1, timeout_s: 60,  max_retries: 1, release_gate: quality }
+  curator:     { layer: 2, model_role: curator,   needs: [outline],      produces: [resource_pack, video, links, images], may_request: [architect],        concurrency: 2, timeout_s: 60,  max_retries: 1, release_gate: verified }
+  teacher:     { layer: 3, model_role: teacher,   needs: [outline],      produces: [notes],                             may_request: [curator, critic],     concurrency: 2, timeout_s: 90,  max_retries: 1, release_gate: verified }
+  critic:      { layer: 3, model_role: critic,    needs: [notes],        produces: [],                                  may_request: [teacher],             concurrency: 2, timeout_s: 60,  max_retries: 1, release_gate: none }
+  quizzer:     { layer: 3, model_role: quizzer,   needs: [notes],        produces: [quiz],                              may_request: [teacher],             concurrency: 2, timeout_s: 60,  max_retries: 1, release_gate: quality }
+  illustrator: { layer: 3, model_role: teacher,   needs: [notes],        produces: [diagram, code_flowchart],           may_request: [teacher],             concurrency: 1, timeout_s: 60,  max_retries: 1, release_gate: verified }
+  slides:      { layer: 3, model_role: teacher,   needs: [notes],        produces: [slide_deck],                        may_request: [teacher],             concurrency: 1, timeout_s: 90,  max_retries: 1, release_gate: quality }
+  diagnoser:   { layer: 4, model_role: critic,    needs: [quiz],         produces: [mastery],                           may_request: [rewriter],            concurrency: 1, timeout_s: 30,  max_retries: 1, release_gate: none }
+  rewriter:    { layer: 4, model_role: editor,    needs: [mastery],      produces: [proposal],                          may_request: [teacher],             concurrency: 1, timeout_s: 60,  max_retries: 1, release_gate: proposal }
+  editor:      { layer: 4, model_role: editor,    needs: [outline],      produces: [proposal],                          may_request: [architect, curator],  concurrency: 1, timeout_s: 60,  max_retries: 1, release_gate: proposal }
+  companion:   { layer: 4, model_role: teacher,   needs: [],             produces: [],                                  may_request: [],                    concurrency: 1, timeout_s: 20,  max_retries: 0, release_gate: none }
+  doubt:       { layer: 4, model_role: teacher,   needs: [outline],      produces: [],                                  may_request: [curator, teacher],    concurrency: 2, timeout_s: 40,  max_retries: 1, release_gate: none }
+  practice:    { layer: 4, model_role: curator,   needs: [outline],      produces: [practice],                          may_request: [],                    concurrency: 1, timeout_s: 60,  max_retries: 1, release_gate: verified }

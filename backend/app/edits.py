@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+from . import depth as depth_mod
 from .agents import editor
 from .errors import UserError
 
@@ -55,6 +56,46 @@ def propose(engine, nid: str, learner_id: str, request: str, source: str = "chat
     return {**view(engine.store, engine.store.get_proposal(pid)), "message_id": mid}
 
 
+def _post(engine, nid: str, source: str, ops: list[dict]) -> dict:
+    """Store validated ops as a pending proposal with its fixed wording, and put the card in the chat."""
+    outline = outline_of(engine.store, nid)
+    lines = [editor.describe(o, outline) for o in ops]
+    for o, line in zip(ops, lines):
+        o["_line"] = line
+    pid = engine.store.add_proposal(nid, source, _summary(lines), ops)
+    mid = engine.store.add_message(nid, "assistant", _summary(lines), kind="proposal", refs=[{"kind": "proposal", "id": pid}])
+    return {**view(engine.store, engine.store.get_proposal(pid)), "message_id": mid}
+
+
+def propose_scope(engine, nid: str, depth: Optional[str] = None, level: Optional[str] = None) -> Optional[dict]:
+    """The Scoper's change of depth or level as a proposal that lists what would be rewritten and roughly how long it takes. Never applied silently."""
+    store, nb = engine.store, engine._nb(nid)
+    cur_depth, cur_level = depth_mod.name_for(store, nid), nb["level"] or "beginner"
+    depth = depth if depth and depth != cur_depth else None
+    level = level if level and level != cur_level else None
+    if not depth and not level:
+        return None
+    chs = store.chapters(nid)
+    affected = [c["id"] for c in chs if c["status"] == "ready" and not c["started"] and not c["completed"]]
+    ops = editor.validate_ops([{"op": "set_scope", "depth": depth, "level": level, "affected_ids": affected, "minutes": round(1.5 * len(affected))}], outline_of(store, nid), cur_level)
+    return _post(engine, nid, "scope", ops)
+
+
+def propose_review(engine, nid: str, session_id: str, after_chapter_id: int, inserts: list[dict], misconception: str) -> Optional[dict]:
+    """The Rewriter's review chapters, as a proposal: nothing is added until the learner applies it, and Undo removes it again."""
+    outline = outline_of(engine.store, nid)
+    pos = {c["id"]: c["position"] for c in outline}
+    raw = []
+    for ins in inserts:
+        after = pos.get(int(ins["after"]), pos.get(after_chapter_id, 0))
+        raw.append({"op": "add_chapter", "after": after, "title": ins["title"], "summary": ins.get("summary", ""), "objectives": ins.get("objectives", []), "minutes": 8, "review_for": misconception, "session": session_id})
+    try:
+        ops = editor.validate_ops(raw, outline, engine._nb(nid)["level"] or "beginner")
+    except ValueError:
+        return None
+    return _post(engine, nid, "rewriter", ops)
+
+
 def _live_ops(engine, nid: str, ops: list[dict]) -> list[dict]:
     """Re-validate against the course as it is now (it may have changed since the proposal was made)."""
     outline = outline_of(engine.store, nid)
@@ -65,7 +106,8 @@ def _live_ops(engine, nid: str, ops: list[dict]) -> list[dict]:
             if o.get(k) and o[k] not in pos:
                 raise UserError("The course changed since this was proposed, so I can't apply it safely. Ask me again and I'll make a fresh proposal.")
         if o["op"] == "add_chapter":
-            raw.append({"op": "add_chapter", "after": pos.get(o["after_id"], 0), "title": o["title"], "summary": o.get("summary", ""), "objectives": o["objectives"], "minutes": o.get("minutes", 12)})
+            raw.append({"op": "add_chapter", "after": pos.get(o["after_id"], 0), "title": o["title"], "summary": o.get("summary", ""), "objectives": o["objectives"], "minutes": o.get("minutes", 12),
+                        **({"review_for": o["review_for"], "session": o.get("session", "")} if o.get("review_for") else {})})
         elif o["op"] in ("remove_chapter", "regenerate_chapter"):
             raw.append({"op": o["op"], "chapter": pos[o["chapter_id"]], **({"focus": o.get("focus", "")} if o["op"] == "regenerate_chapter" else {})})
         elif o["op"] == "move_chapter":
@@ -98,8 +140,8 @@ def apply(engine, nid: str, pid: int) -> dict:
             at = 0 if after is None else order.index(after) + 1
             store.shift_positions(nid, at, 1)
             summary = o["summary"] or "Added at your request."
-            cid = store.add_chapter(nid, at + 1, o["title"], summary, o["objectives"], [after] if after else [], [], kind="core", priority=70,
-                                    meta={"added_by": pid, "minutes": o["minutes"]})
+            cid = store.add_chapter(nid, at + 1, o["title"], summary, o["objectives"], [after] if after else [], [], kind="review" if o.get("review_for") else "core", priority=80 if o.get("review_for") else 70,
+                                    meta={"added_by": pid, "minutes": o["minutes"], **({"misconception": o["review_for"], "session": o.get("session", "")} if o.get("review_for") else {})})
             store.add_job(nid, cid, "chapter")
             keymap[o["key"]] = cid
             undo["added"].append(cid)
@@ -133,6 +175,22 @@ def apply(engine, nid: str, pid: int) -> dict:
             touched.append(cid)
         elif o["op"] == "set_level":
             store.update_notebook(nid, level=o["level"])
+        elif o["op"] == "set_scope":
+            undo["depth"] = depth_mod.name_for(store, nid)
+            if o.get("depth"):
+                depth_mod.set_depth(store, nid, o["depth"])
+            if o.get("level"):
+                store.update_notebook(nid, level=o["level"])
+            for cid in o.get("affected_ids", []):                       # only chapters that are ready and not started are rewritten
+                ch = store.get_chapter(cid)
+                if not ch or ch["status"] != "ready" or ch["started"] or ch["completed"]:
+                    continue
+                store.add_revision(nid, cid, pid, "regenerated", store.chapter_snapshot(cid))
+                store.update_chapter(cid, priority=60, meta={**ch["meta"], "regenerated_by": pid})
+                store.set_chapter_status(cid, "queued")
+                store.add_job(nid, cid, "chapter")
+                undo["regenerated"].append(cid)
+                touched.append(cid)
     engine._assert_acyclic(nid)
     store.update_proposal(pid, status="applied", undo=undo, touched=touched, applied_at=time.time(), ops=ops_with_lines(p["ops"], ops))
     _prune(store, nid)
@@ -184,6 +242,8 @@ def undo(engine, nid: str, pid: int) -> dict:
             store.set_chapter_prereqs(int(cid_s), [x for x in pre if x in alive])
     store.set_positions([c for c in u["order"] if c in alive])
     store.update_notebook(nid, level=u["level"])
+    if u.get("depth"):
+        depth_mod.set_depth(store, nid, u["depth"])
     touched = [c for c in p["touched"] if c in alive] + u["removed"]
     store.update_proposal(pid, status="undone", undone_at=time.time(), touched=touched)
     store.delete_revisions(pid)

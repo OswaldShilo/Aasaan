@@ -56,6 +56,26 @@ CREATE TABLE IF NOT EXISTS chapter_revisions(
   id INTEGER PRIMARY KEY AUTOINCREMENT, notebook_id TEXT, chapter_id INTEGER, proposal_id INTEGER, kind TEXT, snapshot TEXT, created_at REAL);
 CREATE INDEX IF NOT EXISTS ix_revisions_prop ON chapter_revisions(proposal_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_key ON messages(notebook_id, key) WHERE key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS _health(id INTEGER PRIMARY KEY, ts REAL);
+CREATE TABLE IF NOT EXISTS artifacts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, notebook_id TEXT NOT NULL, chapter_id INTEGER, type TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL, owner_agent TEXT, payload TEXT, depends_on TEXT, flags TEXT,
+  priority INTEGER NOT NULL DEFAULT 50, claimed_by TEXT, lease_until REAL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+  created_at REAL, updated_at REAL);
+CREATE INDEX IF NOT EXISTS ix_artifacts_pick ON artifacts(status, priority, id);
+CREATE INDEX IF NOT EXISTS ix_artifacts_nb ON artifacts(notebook_id, chapter_id, type);
+CREATE TABLE IF NOT EXISTS agent_messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, notebook_id TEXT NOT NULL, correlation_id TEXT NOT NULL, from_agent TEXT, to_agent TEXT,
+  type TEXT NOT NULL, artifact_id INTEGER, payload TEXT, dedupe_key TEXT, hop_count INTEGER NOT NULL DEFAULT 0,
+  expires_at REAL, handled INTEGER NOT NULL DEFAULT 0, created_at REAL);
+CREATE INDEX IF NOT EXISTS ix_msgs_inbox ON agent_messages(to_agent, handled, id);
+CREATE INDEX IF NOT EXISTS ix_msgs_corr ON agent_messages(correlation_id);
+CREATE TABLE IF NOT EXISTS decision_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, notebook_id TEXT NOT NULL, chapter_id INTEGER, artifact_id INTEGER, correlation_id TEXT,
+  event_id INTEGER, ts REAL, agent TEXT, kind TEXT, summary TEXT, reason_code TEXT, reason_text TEXT, outcome TEXT,
+  counts TEXT, evidence TEXT, severity TEXT, dedupe_key TEXT);
+CREATE INDEX IF NOT EXISTS ix_decisions_nb ON decision_log(notebook_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_decisions_dedupe ON decision_log(notebook_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
 """
 
 
@@ -73,18 +93,51 @@ def _l(s: Optional[str], default: Any = None) -> Any:
 
 
 class Store:
-    def __init__(self, path: str | Path = ":memory:"):
+    def __init__(self, path: Optional[str | Path] = None):
+        if path is None:
+            from .settings import get_db_path
+            path = get_db_path()
         mem = str(path) == ":memory:"
         if not mem:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self._lock = threading.RLock()
         self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=10, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
-        if not mem:
-            self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
-        self.conn.executescript(SCHEMA)
-        self._migrate()
+        deadline = time.monotonic() + 5.0                       # one shared budget for the three setup steps, not 3 s each
+        if not mem:
+            # Two connections opening the same new file at once can get "database is locked" straight from the WAL switch
+            # (SQLite does not always call the busy handler there), so setup retries briefly instead of failing the start.
+            self._retry_locked(lambda: self.conn.execute("PRAGMA journal_mode=WAL"), deadline)
+            self.conn.execute("PRAGMA synchronous=NORMAL")      # safe with WAL; far fewer fsyncs under many short transactions
+        self._retry_locked(lambda: self.conn.executescript(SCHEMA), deadline)
+        self._retry_locked(self._migrate, deadline)
+
+    @staticmethod
+    def _retry_locked(fn, deadline: float, pause: float = 0.05):
+        while True:
+            try:
+                return fn()
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(pause)
+
+    def check_writable(self) -> tuple[bool, str]:
+        """Confirm database is writable by performing a write inside a transaction that is rolled back."""
+        with self._lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute("INSERT OR REPLACE INTO _health(id, ts) VALUES(1, ?)", (time.time(),))
+                self.conn.execute("ROLLBACK")
+                return True, "ok"
+            except Exception:
+                try:
+                    self.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                return False, "database is not writable"
 
     def _migrate(self) -> None:
         """Additive column migrations for databases created by an earlier version."""
@@ -108,14 +161,15 @@ class Store:
         with self._lock:
             return self.conn.execute(sql, args).fetchall()
 
-    def transaction(self):
-        """Context manager: several writes commit together (a chapter's blocks and its `ready` status)."""
+    def transaction(self, immediate: bool = False):
+        """Context manager: several writes commit together (a chapter's blocks and its `ready` status).
+        `immediate=True` takes the write lock up front (BEGIN IMMEDIATE) so a read-then-write state change cannot interleave."""
         store = self
 
         class _Tx:
             def __enter__(self_inner):
                 store._lock.acquire()
-                store.conn.execute("BEGIN")
+                store.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 return store
 
             def __exit__(self_inner, et, ev, tb):
@@ -156,7 +210,7 @@ class Store:
             ids = [r["id"] for r in self.conn.execute("SELECT id FROM chapters WHERE notebook_id=?", (nid,))]
             for cid in ids:
                 self.conn.execute("DELETE FROM blocks WHERE chapter_id=?", (cid,))
-            for t in ("chapters", "sources", "jobs", "quiz_attempts", "messages", "proposals", "chapter_revisions"):
+            for t in ("decision_log", "agent_messages", "artifacts", "chapters", "sources", "jobs", "quiz_attempts", "messages", "proposals", "chapter_revisions"):
                 self.conn.execute(f"DELETE FROM {t} WHERE notebook_id=?", (nid,))
             self.conn.execute("DELETE FROM notebooks WHERE id=?", (nid,))
 
@@ -393,6 +447,9 @@ class Store:
     def set_memory(self, learner_id: str, kind: str, key: str, value: Any) -> None:
         self._run("INSERT OR REPLACE INTO memory(learner_id,kind,key,value,count,updated) VALUES(?,?,?,?,1,?)",
                   (learner_id, kind, key, _j(value), time.time()))
+
+    def memory_kind(self, learner_id: str, kind: str) -> dict:
+        return {r["key"]: _l(r["value"]) for r in self._all("SELECT key, value FROM memory WHERE learner_id=? AND kind=?", (learner_id, kind))}
 
     def get_memory(self, learner_id: str, kind: str, key: str, default: Any = None) -> Any:
         r = self._one("SELECT value FROM memory WHERE learner_id=? AND kind=? AND key=?", (learner_id, kind, key))

@@ -6,6 +6,7 @@ Needs GEMINI_API_KEY (or OPENROUTER_API_KEY). Without a key the app starts, says
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -16,22 +17,28 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.gzip import GZipMiddleware
+
+from .backup_loop import run_backup_once
+from .security_headers import SecurityHeadersMiddleware
+from .sse import StreamHub
+from .client_ip import get_client_ip, get_rate_limit_key
 
 from .db import Store
 from .engine import Engine, UserError
 from .resilience import mask_key
 from .router import ModelRouter
+from .settings import ROOT, get_db_path, get_uploads_dir, validate_and_prepare_paths
 from .tools import ToolRunner
 from . import visuals, web
 from .visuals.cover import cover_svg
 from .worker import Worker
 
-ROOT = Path(__file__).resolve().parents[2]
 FRONTEND = ROOT / "frontend"
 
 
@@ -96,15 +103,23 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
                start_worker: bool = True, upload_dir: Optional[str] = None) -> FastAPI:
     load_env()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    store = Store(db_path or os.environ.get("AASAAN_DB") or str(ROOT / "data" / "aasaan.db"))
+    resolved_db = get_db_path(db_path)
+    resolved_uploads = get_uploads_dir(upload_dir)
+    validate_and_prepare_paths(resolved_db, resolved_uploads)
+
+    store = Store(resolved_db)
     router = ModelRouter(store=store, provider_override=provider_override)
     tools = ToolRunner(store, router.sink, router.chaos)
     visuals.register(tools)
-    engine = Engine(store, router, upload_dir=upload_dir or os.environ.get("AASAAN_UPLOADS") or str(ROOT / "data" / "uploads"), tools=tools)
+    engine = Engine(store, router, upload_dir=resolved_uploads, tools=tools)
     worker = Worker(engine)
     nb_per_hour = int(os.environ.get("AASAAN_NB_PER_HOUR", "12"))
     creations: dict[str, list[float]] = {}
+    backup_per_hour = int(os.environ.get("AASAAN_BACKUP_PER_HOUR", "6"))
+    backup_requests: dict[str, list[float]] = {}
     log_ = logging.getLogger("aasaan")
+
+    sse_hub = StreamHub()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -114,12 +129,64 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
             threading.Thread(target=router.log_self_test, name="aasaan-self-test", daemon=True).start()
         task = asyncio.create_task(worker.run()) if start_worker else None
         yield
+        await sse_hub.shutdown()
         worker.stop()
         if task:
             task.cancel()
 
     app = FastAPI(title="Aasaan", lifespan=lifespan)
     app.state.engine, app.state.router, app.state.store, app.state.worker, app.state.tools = engine, router, store, worker, tools
+    app.state.sse_hub = sse_hub
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    # ============================================================== csp report
+    csp_report_lock = threading.Lock()
+    csp_report_timestamps: list[float] = []
+    CSP_MAX_BODY = 16384
+
+    @app.post("/csp-report", status_code=204)
+    @app.post("/api/csp-report", status_code=204)
+    async def csp_report_endpoint(request: Request):
+        """Receive and log Content Security Policy violation reports."""
+        cl = request.headers.get("content-length")
+        if cl:
+            try:
+                if int(cl) > CSP_MAX_BODY:
+                    return Response(status_code=204)
+            except ValueError:
+                return Response(status_code=204)
+
+        body = await request.body()
+        if len(body) > CSP_MAX_BODY:
+            return Response(status_code=204)
+
+        now = time.time()
+        with csp_report_lock:
+            cutoff = now - 60.0
+            while csp_report_timestamps and csp_report_timestamps[0] < cutoff:
+                csp_report_timestamps.pop(0)
+            if len(csp_report_timestamps) >= 60:
+                return Response(status_code=204)
+            csp_report_timestamps.append(now)
+
+        if body:
+            try:
+                data = json.loads(body.decode("utf-8", errors="replace"))
+                rep = data.get("csp-report", data) if isinstance(data, dict) else {}
+                if isinstance(rep, dict):
+                    def _clean_uri(u: str) -> str:
+                        return (u.split("?", 1)[0] if isinstance(u, str) else "")[:120]
+
+                    blocked = _clean_uri(rep.get("blocked-uri", ""))
+                    directive = str(rep.get("violated-directive", rep.get("effective-directive", "")))[:60]
+                    doc = _clean_uri(rep.get("document-uri", ""))
+                    disp = str(rep.get("disposition", "report"))[:20]
+                    log_.warning("[csp-report] blocked_uri=%s directive=%s document=%s disposition=%s", blocked, directive, doc, disp)
+            except Exception:
+                pass
+
+        return Response(status_code=204)
 
     @app.middleware("http")
     async def no_cache_ui(request, call_next):  # always serve the latest UI files
@@ -138,13 +205,27 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
         if token:
             if request.headers.get("x-admin-token") != token:
                 raise HTTPException(403, "admin token required")
-        elif (request.client.host if request.client else "") not in ("127.0.0.1", "::1", "testclient"):
+        elif get_client_ip(request) not in ("127.0.0.1", "::1", "testclient"):
             raise HTTPException(403, "internal endpoint: localhost only (set AASAAN_ADMIN_TOKEN to allow remote use)")
 
     # ================================================================ health
-    @app.get("/api/health")
     @app.get("/health")
     def health():
+        """Fast, dependency-free liveness probe: returns 200 with ok: true without touching DB or models."""
+        return {"ok": True}
+
+    @app.get("/health/ready")
+    @app.get("/api/health/ready")
+    def health_ready():
+        """Readiness probe: confirms database is writable. Returns 200 on success or 503 on failure."""
+        writable, msg = store.check_writable()
+        if not writable:
+            return JSONResponse({"ok": False, "reason": msg}, status_code=503)
+        return {"ok": True}
+
+    @app.get("/api/health")
+    def api_health():
+        """Detailed application status and model connectivity."""
         return {"ok": True, "app": "aasaan", "mode": router.mode, "model_ready": router.model_ready(), "killed": sorted(router.killed)}
 
     @app.get("/api/health/models")
@@ -193,20 +274,19 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
         language: str = Form("en"),
         files: list[UploadFile] = File(default=[]),
     ):
-        ip = request.client.host if request.client else "?"
+        rate_key = get_rate_limit_key(request)
         now = time.time()
-        recent = [t for t in creations.get(ip, []) if now - t < 3600]
+        recent = [t for t in creations.get(rate_key, []) if now - t < 3600]
         if len(recent) >= nb_per_hour:
             raise HTTPException(429, "You have created a lot of notebooks this hour. Please try again later.")
         data = [(f.filename or "file", f.content_type or "", await f.read()) for f in files if f is not None and f.filename]
         nid = await run_in_threadpool(engine.create_notebook, learner_id, text, language, data)
-        creations[ip] = recent + [now]
+        creations[rate_key] = recent + [now]
         return {"notebook_id": nid}
 
     @app.get("/api/notebooks/{nid}/cover.svg")
     def notebook_cover(nid: str):
         """Generated cover (deterministic from the title): no network, no model."""
-        from fastapi.responses import Response
         nb = engine.notebook_view(nid)
         return Response(cover_svg(nb["title"], nb.get("goal") or ""), media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
 
@@ -215,8 +295,9 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
         return engine.notebook_view(nid)
 
     @app.delete("/api/notebooks/{nid}")
-    def delete_notebook(nid: str):
+    async def delete_notebook(nid: str):
         engine.delete_notebook(nid)
+        await sse_hub.remove_notebook(nid)
         return {"ok": True}
 
     @app.post("/api/notebooks/{nid}/retry")
@@ -225,27 +306,45 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
         return {"ok": True}
 
     @app.get("/api/notebooks/{nid}/stream")
-    async def stream(nid: str, request: Request):
-        """Server-sent events: a fresh notebook snapshot whenever anything changes (chapters filling in live)."""
+    async def stream(nid: str, request: Request, last_event_id: Optional[int] = Query(None)):
+        """Server-sent events: live notebook snapshot with monotonic IDs, keepalives, and auto-reconnect."""
         engine._nb(nid)
+        return StreamingResponse(
+            sse_hub.subscribe(nid, engine, request, last_event_id=last_event_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
-        async def gen():
-            last, idle, seq = None, 0, 0
-            yield "retry: 2000\n\n"   # the browser reconnects by itself and gets the current full snapshot (state, not a delta)
-            while not await request.is_disconnected():
-                view = await run_in_threadpool(engine.notebook_view, nid)
-                payload = json.dumps(view)
-                if payload != last:
-                    last, idle, seq = payload, 0, seq + 1
-                    yield f"id: {seq}\ndata: {payload}\n\n"
-                else:
-                    idle += 1
-                    if idle % 15 == 0:
-                        yield ": ping\n\n"
-                await asyncio.sleep(1.0)
+    @app.get("/api/dev/trace/{nid}")
+    def dev_trace(nid: str):
+        """Developer trace (AASAAN_TRACE=on only; never shown to learners): the board mirror, the agent messages, the technical events and every decision record."""
+        if os.environ.get("AASAAN_TRACE", "off").strip().lower() not in ("on", "1", "true", "yes"):
+            raise HTTPException(404, "not found")
+        engine._nb(nid)
+        sh = engine._shadow(nid)
+        board = sh.trace(nid) if sh else {"artifacts": [], "messages": [], "note": "AASAAN_ORCHESTRATOR is off for this notebook"}
+        return {**board, "events": store.events(300), "decisions": engine.decisions.recent(nid, limit=500)}
 
-        return StreamingResponse(gen(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    @app.get("/api/notebooks/{nid}/scope")
+    def scope(nid: str):
+        return engine.scope_view(nid)
+
+    @app.post("/api/notebooks/{nid}/scope")
+    def set_scope(nid: str, depth: Optional[str] = Form(None), level: Optional[str] = Form(None)):
+        """A scope change is a PROPOSAL (what would be rewritten, roughly how long); it is applied from the chat card. None = nothing to change."""
+        if depth not in (None, "", "quick", "standard", "deep") or level not in (None, "", "beginner", "intermediate", "advanced"):
+            raise HTTPException(400, "unknown depth or level")
+        return {"proposal": engine.propose_scope(nid, depth or None, level or None)}
+
+    @app.get("/api/notebooks/{nid}/review")
+    def review(nid: str, learner_id: str):
+        """A 5-minute spaced review from what this learner got wrong or is weak at (empty when nothing is weak)."""
+        return {"summary": engine.review_summary(learner_id, nid), "questions": engine.review_items(learner_id, nid)}
+
+    @app.get("/api/notebooks/{nid}/decisions")
+    def decisions(nid: str, since: int = 0, chapter_id: Optional[int] = None, agent: Optional[str] = None, severity: Optional[str] = None):
+        """The Activity feed: what each agent decided and what came out of it, in plain words. Replays from `since` (0 = everything)."""
+        return engine.decisions_view(nid, since, chapter_id, agent, severity)
 
     # ---- chat thread
     @app.get("/api/notebooks/{nid}/messages")
@@ -291,7 +390,6 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
 
     @app.get("/api/notebooks/{nid}/resources/{sid}/thumb")
     def resource_thumb(nid: str, sid: str):
-        from fastapi.responses import Response
         png = _res_guard(engine.resource_thumb, nid, sid)
         if not png:
             raise HTTPException(404, "no thumbnail")
@@ -307,7 +405,7 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
 
     @app.post("/api/notebooks/{nid}/chat")
     async def chat(nid: str, learner_id: str = Form(...), text: str = Form(""), chapter_id: Optional[int] = Form(None), block_ids: str = Form(""),
-                   files: list[UploadFile] = File(default=[])):
+                   mode: str = Form("answer"), files: list[UploadFile] = File(default=[])):
         """One chat turn as a server-sent stream: `user` (stored), `status`, `delta` pieces of the validated answer, `done` (stored, with chips).
         The answer is validated against the sources BEFORE it is shown, so it streams from the checked text, not from raw model tokens."""
         engine._nb(nid)
@@ -337,7 +435,7 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
                     yield ev("done", {"id": None, "refs": []})
                     return
                 yield ev("status", {"text": "Thinking…"})
-                res = await run_in_threadpool(engine.handle_chat, nid, learner_id, question, chapter_id, blocks)
+                res = await run_in_threadpool(engine.handle_chat, nid, learner_id, question, chapter_id, blocks, "guide" if mode == "guide" else "answer")
                 if res["type"] == "proposal":      # a card with Apply and Dismiss: nothing has changed yet
                     p = res["proposal"]
                     yield ev("proposal", {"id": p["message_id"], "proposal": {k: v for k, v in p.items() if k != "message_id"}, "content": p["summary"]})
@@ -476,6 +574,44 @@ def create_app(db_path: Optional[str] = None, provider_override=None, self_test_
         require_admin(request)
         router.revive(body.model)
         return {"killed": sorted(router.killed)}
+
+    @app.post("/api/admin/backup")
+    async def force_backup(request: Request):
+        admin_token = os.environ.get("AASAAN_ADMIN_TOKEN", "").strip()
+        if not admin_token:
+            raise HTTPException(503, "admin token not configured")
+
+        req_token = request.headers.get("x-admin-token", "")
+        if not req_token or not hmac.compare_digest(req_token, admin_token):
+            raise HTTPException(403, "admin token required")
+
+        rate_key = get_rate_limit_key(request)
+        now = time.time()
+        recent = [t for t in backup_requests.get(rate_key, []) if now - t < 3600]
+        if len(recent) >= backup_per_hour:
+            raise HTTPException(429, "Too many backup requests. Please try again later.")
+        backup_requests[rate_key] = recent + [now]
+
+        ok, status_msg, final_path, size_bytes, duration = await run_in_threadpool(
+            run_backup_once, db_path=resolved_db
+        )
+        if not ok:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": status_msg,
+                    "file": final_path.name if final_path else None,
+                    "size": size_bytes,
+                    "duration": round(duration, 3),
+                },
+                status_code=500,
+            )
+        return {
+            "ok": True,
+            "file": final_path.name if final_path else None,
+            "size": size_bytes,
+            "duration": round(duration, 3),
+        }
 
     # ================================================================ frontend
     if FRONTEND.exists():

@@ -5,6 +5,7 @@ import { renderMarkdown } from "./markdown.js";
 import { renderGraph, legend } from "./graph.js";
 import { createChat } from "./chat.js";
 import { createResources } from "./resources.js";
+import { createActivity } from "./activity.js";
 
 const $app = document.getElementById("app");
 const $bar = document.getElementById("bar");
@@ -27,6 +28,7 @@ function cleanup() {
   if (S.hero) { S.hero.destroy(); S.hero = null; }
   clearInterval(S.poll); S.poll = null;
   if (S.es) { S.es.close(); S.es = null; }
+  setReconnecting(false);
 }
 
 function topbar(right = "") {
@@ -194,7 +196,7 @@ async function workspace(nid, cid) {
       </div>
       <div class="board-scroll" id="boardscroll">
       <div id="courseview">
-        <div class="nbhead"><div class="cover" id="cover"></div><div><h1 id="nbtitle"><span class="bar-s w60"></span></h1><p class="muted" id="nbdesc"></p></div><div class="ready" id="ready"></div></div>
+        <div class="nbhead"><div class="cover" id="cover"></div><div><h1 id="nbtitle"><span class="bar-s w60"></span></h1><p class="muted" id="nbdesc"></p><div class="scopechips" id="scopechips" aria-label="Course scope"></div></div><div class="ready" id="ready"></div></div>
         <div id="note"></div>
         <div class="nb"><button class="chaps-toggle" id="chaps" aria-expanded="false">${ICON.list} Chapters</button>
           <aside class="side" id="side" aria-label="Chapters"></aside><section class="main" id="main" aria-live="polite"></section></div>
@@ -205,11 +207,14 @@ async function workspace(nid, cid) {
     <div class="divider" id="divider" role="separator" aria-orientation="vertical" aria-label="Resize the chat panel" tabindex="0" aria-valuemin="30" aria-valuemax="80" aria-valuenow="${prefs.w}"></div>
     <aside class="chatpane" id="chatpane" aria-label="Chat with Aasaan">
       <header class="chat-h"><span class="chat-name">${logoSvg("head-logo")} Aasaan</span>
+        <div class="vseg chat-tabs" role="group" aria-label="Chat or activity"><button id="ct-chat" aria-pressed="true" type="button">Chat</button><button id="ct-act" aria-pressed="false" type="button">Activity</button></div>
         <button class="iconbtn" id="dissolve" aria-label="Collapse chat" aria-keyshortcuts="Control+\\" title="Collapse chat (Ctrl+\\)">${ICON.right}</button></header>
+      <div class="activity" id="activity" hidden aria-label="Activity"></div>
       <div class="msgs" id="msgs" role="log" aria-live="polite" aria-label="Conversation"></div>
       <button class="jump" id="jump" type="button" hidden>New messages ↓</button>
       <div class="chat-compose" id="chatcompose">
         <div class="suggest" id="suggest" aria-label="Suggestions"></div>
+        <div class="moderow" id="moderow" role="group" aria-label="How should I answer?"><button type="button" data-m="answer" aria-pressed="true">Just tell me</button><button type="button" data-m="guide" aria-pressed="false">Guide me</button></div>
         <div class="ctxrow" id="ctxrow"></div><div class="att-row" id="chatatts"></div>
         <div class="chat-input"><textarea id="chatinput" rows="2" placeholder="Ask about your course, or add a file or link…" aria-label="Message Aasaan"></textarea>
           <div class="toolbar"><button class="iconbtn" id="chatattach" type="button" aria-label="Attach files">${ICON.clip}</button>
@@ -227,6 +232,7 @@ async function workspace(nid, cid) {
   paintShell();
   try { S.nb = await api("notebooks/" + nid); } catch (e) { fail(e); location.hash = "#/"; return; }
   renderHead(); renderSide(); settleCourse(cid);
+  renderScope(nid);
   S.res = createResources({ nid, api, toast, openChapter: (id) => { document.getElementById("vt-course").click(); loadChapter(id, false, false); }, isVisible: () => !document.getElementById("resview").hidden });
   S.res.refresh(true);
   S.chat = createChat({
@@ -235,7 +241,11 @@ async function workspace(nid, cid) {
     notifyUnread: () => { document.getElementById("chatdot").hidden = false; document.getElementById("tabdot").hidden = false; },
     openChat: () => S.panes.open(), onChip: chatChip, afterEdit: () => api("notebooks/" + nid).then(onSnapshot).catch(() => {}), wireMic: (btn, onText) => wireMic(btn, onText, () => lang()),
   });
-  api(`notebooks/${nid}/companion?learner_id=${S.learner}`).then((c) => { S.companion = c.message; renderNote(); }).catch(() => {});
+  S.activity = createActivity({ nid, api, getChapters: () => S.nb?.chapters, openChapter: (id) => { document.getElementById("vt-course")?.click(); loadChapter(id, false, false); } });
+  const pane = document.getElementById("chatpane");
+  const showTab = (t) => { pane.dataset.tab = t; document.getElementById("ct-chat").setAttribute("aria-pressed", String(t === "chat")); document.getElementById("ct-act").setAttribute("aria-pressed", String(t === "activity")); if (t === "activity") S.activity.draw(); };
+  document.getElementById("ct-chat").onclick = () => showTab("chat"); document.getElementById("ct-act").onclick = () => showTab("activity");
+  api(`notebooks/${nid}/companion?learner_id=${S.learner}`).then((c) => { S.companion = c.message; S.review = c.review; renderNote(); }).catch(() => {});
   connect(nid);
 }
 
@@ -340,19 +350,80 @@ function chatChip(c) {
   } else if (c.kind === "link" && c.url) window.open(c.url, "_blank", "noopener");
 }
 
+function setReconnecting(on) {
+  let el = document.getElementById("reconnecting-badge");
+  if (!el && on) {
+    el = document.createElement("div");
+    el.id = "reconnecting-badge";
+    el.className = "reconnecting-badge";
+    el.textContent = "Reconnecting…";
+    document.body.appendChild(el);
+  }
+  if (el) el.classList.toggle("on", on);
+}
+
 function connect(nid) {
+  S.lastEventId = null;
+  let reconnectTimer = null;
   const apply = (nb) => onSnapshot(nb);
-  const poll = () => { if (!S.poll) S.poll = setInterval(async () => { try { apply(await api("notebooks/" + nid)); } catch { /* retry */ } }, 3000); };
+  const poll = () => {
+    if (!S.poll) {
+      S.poll = setInterval(async () => {
+        try { apply(await api("notebooks/" + nid)); } catch { /* retry */ }
+      }, 3000);
+    }
+  };
+
+  const clearReconnect = () => {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    setReconnecting(false);
+  };
+
   if (window.EventSource) {
     S.es = new EventSource(`/api/notebooks/${nid}/stream`);
-    S.es.onmessage = (e) => apply(JSON.parse(e.data));
-    S.es.onerror = poll;  // fall back to polling when the stream drops
-  } else poll();
+    S.es.onopen = () => {
+      clearReconnect();
+      if (S.poll) { clearInterval(S.poll); S.poll = null; }
+    };
+    S.es.onmessage = (e) => {
+      clearReconnect();
+      if (S.poll) { clearInterval(S.poll); S.poll = null; }
+      if (e.lastEventId) {
+        const id = parseInt(e.lastEventId, 10);
+        if (!isNaN(id)) {
+          if (S.lastEventId !== null && id <= S.lastEventId) return;
+          S.lastEventId = id;
+        }
+      }
+      try { apply(JSON.parse(e.data)); } catch { /* ignore malformed */ }
+    };
+    S.es.addEventListener("resync", async () => {
+      clearReconnect();
+      try {
+        const nb = await api("notebooks/" + nid);
+        apply(nb);
+      } catch { /* will catch up */ }
+    });
+    S.es.onerror = () => {
+      // Reconnecting state is standard EventSource behavior on server close (every ~200s).
+      // Only show visual indicator if reconnecting takes longer than 3.5 seconds.
+      if (S.es && S.es.readyState === EventSource.CONNECTING) {
+        if (!reconnectTimer) {
+          reconnectTimer = setTimeout(() => setReconnecting(true), 3500);
+        }
+      } else if (S.es && S.es.readyState === EventSource.CLOSED) {
+        clearReconnect();
+        poll();
+      }
+    };
+  } else {
+    poll();
+  }
 }
 
 function onSnapshot(nb) {
   const cur = S.chapter, hadChapters = !!(S.nb && S.nb.chapters.length);
-  S.nb = nb; renderHead(); renderSide(); S.chat?.onSnapshot(nb); S.res?.onSnapshot();
+  S.nb = nb; renderHead(); renderSide(); S.chat?.onSnapshot(nb); S.res?.onSnapshot(); S.activity?.refresh(nb.decision_seq);
   if (!S.chapter || !hadChapters || nb.status === "failed") settleCourse();
   flashEdits(nb);
   const crumb = document.querySelector(".crumb");   // the chapter count can change under the reader (an applied or undone edit)
@@ -368,8 +439,27 @@ function onSnapshot(nb) {
 
 function renderNote() {
   const n = document.getElementById("note"); if (!n) return;
-  n.innerHTML = S.companion ? `<div class="notice">${esc(S.companion)}<button class="x2" aria-label="Dismiss">×</button></div>` : "";
+  const rv = S.review && S.review.available ? `<button class="btn" id="startreview">Start ${S.review.minutes}-minute review</button>` : "";
+  n.innerHTML = S.companion ? `<div class="notice"><span>${esc(S.companion)} ${rv}</span><button class="x2" aria-label="Dismiss">×</button></div>` : "";
   const x = n.querySelector(".x2"); if (x) x.onclick = () => { S.companion = ""; renderNote(); };
+  const sr = n.querySelector("#startreview"); if (sr) sr.onclick = startReview;
+}
+
+// scope chips: depth and level. Changing one is a PROPOSAL in the chat (what would be rewritten, how long); nothing changes until it is applied
+async function renderScope(nid) {
+  const box = document.getElementById("scopechips"); if (!box) return;
+  let sc; try { sc = await api(`notebooks/${nid}/scope`); } catch { return; }
+  const sel = (name, label, opts, cur) => `<label class="scopechip"><span class="muted">${label}</span><select name="${name}" aria-label="${label}">${opts.map((o) => `<option value="${o}" ${o === cur ? "selected" : ""}>${o[0].toUpperCase() + o.slice(1)}</option>`).join("")}</select></label>`;
+  box.innerHTML = sel("depth", "Depth", sc.depths, sc.depth) + sel("level", "Level", sc.levels, sc.level);
+  box.querySelectorAll("select").forEach((el) => el.onchange = async () => {
+    const f = new FormData(); f.append(el.name, el.value);
+    try {
+      const r = await api(`notebooks/${nid}/scope`, null, f);
+      toast(r.proposal ? "I made a suggestion in the chat. Nothing changes until you apply it." : "That is already the setting.");
+      if (r.proposal) S.panes?.open();
+    } catch (e) { fail(e); }
+    el.value = sc[el.name];                                   // the setting only moves when the proposal is applied
+  });
 }
 
 function renderHead() {
@@ -439,13 +529,15 @@ function renderChapter() {
     ${next ? `<button class="btn ghost" data-go="${next.id}">${esc(next.title.slice(0, 28))} ${ICON.right}</button>` : ""}</nav>`;
   if (ch.status !== "ready") { main.innerHTML = head + skeleton(ch) + nav; wireNav(main); return; }
   const issues = ch.review_issues || [];
-  const notices = [ch.unverified ? `<div class="flag"><p>A few claims couldn't be fully verified.</p>
+  const cl = ch.claims;
+  const verifiedLine = cl && cl.total ? `<p class="claimline ${ch.unverified ? "partial" : "ok"}" role="status">${ch.unverified ? `Checked ${cl.verified} of ${cl.total} claims. The rest could not be verified.` : `Verified ${cl.verified} of ${cl.total} claims.`}</p>` : "";
+  const notices = [verifiedLine, ch.unverified ? `<div class="flag"><p>A few claims couldn't be fully verified.</p>
       <div class="flag-actions">${issues.length ? `<button class="linkbtn" id="seeclaims" aria-expanded="false">See which claims</button>` : ""}<button class="linkbtn" id="recheck">Re-check</button></div>
       <ul class="claims" id="claims" hidden>${issues.map((i) => `<li>${esc(i.claim)} <span class="muted">(${esc(i.source_status)})</span></li>`).join("")}</ul></div>` : "",
                    !ch.grounded ? `<p class="flag">Written from general knowledge; no source material was supplied.</p>` : "",
                    ...(ch.curator_notes || []).map((n) => `<p class="flag">${esc(n)}</p>`)].join("");
   main.innerHTML = head + notices + ch.blocks.map(blockWithAsk).join("") + doubtHtml() + nav;
-  wireNav(main); wireBlocks(main); wireClaims(main); wireAsk(main);
+  wireNav(main); wireBlocks(main); wireClaims(main); wireAsk(main); wireFlow(main);
 }
 
 function skeleton(ch) {
@@ -480,10 +572,14 @@ function blockHtml(b) {
       <figcaption>${esc(c.title)} · ${esc(a.author || "Unknown")} · ${esc(a.license || "")} · <a href="${esc(a.page_url || c.url)}" target="_blank" rel="noopener noreferrer">${esc(a.source || "source")}</a></figcaption></figure></section>`; }
     case "visual": {
       const a = c.attribution, p = c.payload || {};
-      const body = p.svg ? `<div class="vz-wrap" role="img" aria-label="${esc(c.alt_text)}">${p.svg}</div>`
+      const lv = p.levels ? `<div class="vz-tabs" role="group" aria-label="Detail level">${["high", "detailed"].filter((k) => p.levels[k]).map((k) => `<button type="button" data-lv="${k}" aria-pressed="${k === p.level}">${k === "high" ? "High level" : "Detailed"}</button>`).join("")}</div>` : "";
+      const codeBox = p.code ? `<details class="vz-codewrap"><summary>Show the code</summary><pre class="vz-code">${p.code.split("\n").map((l, i) => `<span class="cl" data-l="${i + 1}">${esc(l) || " "}</span>`).join("\n")}</pre></details>` : "";
+      const body = p.svg ? `${lv}<div class="vz-wrap" role="img" aria-label="${esc(c.alt_text)}">${p.svg}</div>${codeBox}`
         : `<img src="${esc(p.url)}" alt="${esc(c.alt_text)}" loading="lazy" referrerpolicy="no-referrer">`;
       const credit = a ? ` · ${esc(a.author || "Unknown")} · ${esc(a.license || "")} · <a href="${esc(a.page_url || p.url)}" target="_blank" rel="noopener noreferrer">${esc(a.source || "source")}</a>` : "";
       return `<section class="blk"><figure class="img visual">${body}<figcaption>${esc(c.caption)}${credit}</figcaption></figure></section>`; }
+    case "practice": return `<section class="blk"><div class="blk-h"><h3>Practice</h3></div><p class="muted">${esc(c.note || "")}</p>
+      <ul class="plist">${(c.items || []).map((i) => `<li><a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">${esc(i.title)}</a> <span class="muted">${esc(i.detail || "")}</span></li>`).join("")}</ul><p class="muted">Source: ${esc(c.source || "")}</p></section>`;
     case "link": return `<section class="blk"><a class="linkcard" href="${esc(c.url)}" target="_blank" rel="noopener noreferrer"><span class="lt">${esc(c.title)}</span>
       <span class="ls">${esc(c.source)} ${ICON.ext}</span><span class="lr">${esc(c.reason)}</span></a></section>`;
     case "quiz": return `<section class="blk" id="quizblk"><div class="blk-h"><h3>Check yourself</h3></div><div id="quiz"></div></section>`;
@@ -495,6 +591,20 @@ function blockHtml(b) {
 function doubtHtml() {
   return `<section class="blk"><div class="blk-h"><h3>Ask a doubt</h3></div><div class="doubt-row"><input id="dq" placeholder="Type your doubt and press Enter" aria-label="Your doubt">
     <button class="iconbtn" id="dmic" aria-label="Ask by voice">${ICON.mic}</button></div><div id="dans"></div></section>`;
+}
+
+// code flowcharts: High level / Detailed toggle, and a node lights up the code lines it stands for
+function wireFlow(main) {
+  main.querySelectorAll(".vz-tabs").forEach((tabs) => {
+    const sec = tabs.closest("section"), blk = S.chapter.blocks.find((b) => String(b.id) === sec?.dataset.bid);
+    const pl = blk?.content?.payload; if (!pl?.levels) return;
+    const wrap = sec.querySelector(".vz-wrap"); let level = pl.level;
+    const clear = () => sec.querySelectorAll(".cl.hl").forEach((l) => l.classList.remove("hl"));
+    const light = (id) => { clear(); const r = pl.levels[level].lines[id]; if (!r) return; sec.querySelector(".vz-codewrap")?.setAttribute("open", ""); sec.querySelectorAll(".cl").forEach((l) => { const n = Number(l.dataset.l); if (n >= r[0] && n <= r[1]) l.classList.add("hl"); }); };
+    const wireNodes = () => wrap.querySelectorAll(".fn").forEach((g) => { g.tabIndex = 0; g.onmouseenter = g.onfocus = () => light(g.dataset.n); g.onmouseleave = g.onblur = clear; });
+    tabs.querySelectorAll("button").forEach((b) => b.onclick = () => { level = b.dataset.lv; wrap.innerHTML = pl.levels[level].svg; tabs.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b))); clear(); wireNodes(); });
+    wireNodes();
+  });
 }
 
 function wireNav(main) {
@@ -545,58 +655,115 @@ function editNotes(bid) {
 function renderSlides(b) {
   const el = document.getElementById("sl-" + b.id); if (!el) return;
   const cards = b.content.cards, i = Math.min(S.slide[b.id] || 0, cards.length - 1), c = cards[i];
-  el.innerHTML = `<div class="slide"><span class="badge">Slide ${i + 1} of ${cards.length}</span><h4>${esc(c.title)}</h4>
-    <ul>${c.points.map((p) => `<li>${esc(p)}</li>`).join("")}</ul></div>
-    <div class="slide-nav"><button class="iconbtn" data-d="-1" aria-label="Previous slide" ${i === 0 ? "disabled" : ""}>${ICON.left}</button>
+  const TYPE = { title: "Objectives", concept: "Concept", example: "Example", diagram: "Diagram", comparison: "Comparison", code: "Code", mistake: "Common mistake", recap: "Recap", check: "Check yourself" };
+  el.innerHTML = `<div class="slide ${c.type ? "t-" + c.type : ""}"><span class="badge">Slide ${i + 1} of ${cards.length}${c.type && TYPE[c.type] ? ` · ${TYPE[c.type]}` : ""}</span><h4>${esc(c.title)}</h4>
+    <ul>${c.points.map((p) => `<li>${esc(p)}</li>`).join("")}</ul>${c.note ? `<details class="slide-note"><summary>Speaker notes</summary><p>${esc(c.note)}</p></details>` : ""}</div>
+    <div class="slide-nav"><button class="iconbtn" data-full aria-label="Full screen" title="Full screen">${ICON.expand}</button><button class="iconbtn" data-d="-1" aria-label="Previous slide" ${i === 0 ? "disabled" : ""}>${ICON.left}</button>
       <span class="dotrow">${cards.map((_, k) => `<i class="${k === i ? "on" : ""}"></i>`).join("")}</span>
       <button class="iconbtn" data-d="1" aria-label="Next slide" ${i === cards.length - 1 ? "disabled" : ""}>${ICON.right}</button></div>`;
   const go = (d) => { S.slide[b.id] = Math.max(0, Math.min(cards.length - 1, i + d)); renderSlides(b); document.getElementById("sl-" + b.id)?.focus(); };
   el.querySelectorAll("[data-d]").forEach((x) => x.onclick = () => go(Number(x.dataset.d)));
-  el.onkeydown = (e) => { if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1); };
+  el.onkeydown = (e) => { if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1); else if (e.key === "f" || e.key === "F") el.requestFullscreen?.(); };
+  el.querySelector("[data-full]").onclick = () => (document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.());
 }
 
-// --- quiz: one question at a time, hint first, misconception feedback, then the course may change
-function startQuiz(questions) {
-  S.quiz = { cid: S.chapter.id, qs: questions, i: 0, right: 0 };
+// a short spaced review from what this learner is weak at: the same quiz screen, questions from several chapters, practice only
+async function startReview() {
+  try {
+    const r = await api(`notebooks/${S.nb.id}/review?learner_id=${S.learner}`);
+    if (!r.questions.length) return toast("Nothing needs a review right now.");
+    document.getElementById("vt-course")?.click();
+    S.companion = ""; renderNote();
+    const host = document.getElementById("main"); host.innerHTML = `<section class="blk" id="quizblk"><div class="blk-h"><h3>${r.summary.minutes}-minute review</h3></div><div id="quiz"></div></section>`;
+    S.chapter = S.chapter || { id: r.questions[0].chapter_id, blocks: [] }; S.quiz = null;
+    startQuiz(r.questions, true);
+  } catch (e) { fail(e); }
+}
+
+// --- quiz: one question at a time, hint first, misconception feedback, marks, a mascot that reacts, then the course may change
+const MASCOT_SAY = {
+  idle: ["Take your time. I'm here if you need a hint."], thinking: ["Let me check that..."],
+  cheer: ["Yes! That's right.", "Nicely done.", "Exactly."], oops: ["Close. Check the part about it in the notes.", "Not quite. Try again with the hint."],
+  proud: ["You've got this chapter. I'll bring back the tricky bits in your review."], learn: ["I'll remember this for your review."],
+};
+const say = (state) => { const l = MASCOT_SAY[state]; return l[Math.floor(Math.random() * l.length)]; };
+function mascot(state, text) {
+  const m = document.getElementById("qmascot"); if (!m) return;
+  m.dataset.state = state; m.querySelector(".qbubble").textContent = text || say(state);
+}
+const mascotHtml = () => `<div class="qmascot" id="qmascot" data-state="idle" role="status" aria-live="polite"><span class="qm-fig" aria-hidden="true">${logoSvg()}</span><span class="qbubble">${esc(say("idle"))}</span></div>`;
+
+function startQuiz(questions, retake = false) {
+  S.quiz = { cid: S.chapter.id, qs: questions, i: 0, right: 0, retake };
   renderQuestion(1, "");
+}
+
+function inputs(q) {
+  if (q.type === "multi") return `<p class="muted q-tip">Select all that apply.</p><div id="opts">${q.options.map((o, k) => `<button class="option toggle" aria-pressed="false" data-k="${k}">${esc(o)}</button>`).join("")}</div><button class="btn block" id="check">Check answer</button>`;
+  if (q.type === "order") return `<p class="muted q-tip">Put the steps in order.</p><ol id="ord" class="ordlist">${q.options.map((o) => `<li data-v="${esc(o)}"><span>${esc(o)}</span><span class="ordbtns"><button type="button" class="iconbtn up" aria-label="Move up">&uarr;</button><button type="button" class="iconbtn dn" aria-label="Move down">&darr;</button></span></li>`).join("")}</ol><button class="btn block" id="check">Check order</button>`;
+  if (q.type === "fill_blank") return `<input id="fillin" class="fillin" type="text" autocomplete="off" aria-label="Your answer" placeholder="Type your answer"><button class="btn block" id="check">Check answer</button>`;
+  return `<div id="opts">${q.options.map((o, k) => `<button class="option" data-k="${k}">${esc(o)}</button>`).join("")}</div>`;
 }
 
 function renderQuestion(attempt, hint) {
   const el = document.getElementById("quiz"); if (!el || !S.quiz) return;
   const { qs, i } = S.quiz, q = qs[i];
-  el.innerHTML = `<div class="crumb">Question ${i + 1} of ${qs.length}</div><h4 class="q-title">${esc(q.text)}</h4>
-    <div id="opts">${q.options.map((o, k) => `<button class="option" data-k="${k}">${esc(o)}</button>`).join("")}</div>
-    <div id="fb">${hint ? `<div class="feedback bad">Hint: ${esc(hint)}</div>` : ""}</div>`;
-  el.querySelectorAll(".option").forEach((b) => b.onclick = () => submitAnswer(q, b, attempt));
+  el.innerHTML = `${mascotHtml()}<div class="crumb">${S.quiz.retake ? "Retake · " : ""}Question ${i + 1} of ${qs.length}${q.difficulty > 1 ? ` · ${q.difficulty === 3 ? "hard" : "medium"}` : ""}</div><h4 class="q-title">${esc(q.text)}</h4>
+    ${inputs(q)}<div id="fb">${hint ? `<div class="feedback bad">Hint: ${esc(hint)}</div>` : ""}</div>`;
+  if (hint) mascot("oops", "Not quite. Try again with the hint.");
+  const type = q.type || "mcq";
+  if (type === "mcq") el.querySelectorAll(".option").forEach((b) => b.onclick = () => submitAnswer(q, b.textContent, attempt, [b]));
+  else if (type === "multi") {
+    el.querySelectorAll(".option").forEach((b) => b.onclick = () => b.setAttribute("aria-pressed", String(b.getAttribute("aria-pressed") !== "true")));
+    el.querySelector("#check").onclick = () => { const picked = [...el.querySelectorAll('.option[aria-pressed="true"]')]; if (!picked.length) return toast("Pick at least one answer."); submitAnswer(q, picked.map((b) => b.textContent).join(" || "), attempt, picked); };
+  } else if (type === "order") {
+    const list = el.querySelector("#ord");
+    list.onclick = (e) => { const li = e.target.closest("li"), up = e.target.closest(".up"), dn = e.target.closest(".dn"); if (!li) return; if (up && li.previousElementSibling) list.insertBefore(li, li.previousElementSibling); if (dn && li.nextElementSibling) list.insertBefore(li.nextElementSibling, li); };
+    el.querySelector("#check").onclick = () => submitAnswer(q, [...list.children].map((li) => li.dataset.v).join(" || "), attempt, []);
+  } else {
+    const box = el.querySelector("#fillin"); box.focus();
+    const go = () => { if (box.value.trim()) submitAnswer(q, box.value.trim(), attempt, [box]); };
+    el.querySelector("#check").onclick = go; box.onkeydown = (e) => { if (e.key === "Enter") go(); };
+  }
 }
 
-async function submitAnswer(q, btn, attempt) {
-  document.querySelectorAll(".option").forEach((b) => (b.disabled = true));
-  btn.classList.add("picked");
+async function submitAnswer(q, answer, attempt, els) {
+  el_disable(true); els.forEach((b) => b.classList?.add("picked")); mascot("thinking");
   try {
-    const r = await api(`chapters/${S.chapter.id}/answer`, { learner_id: S.learner, session_id: S.session, question_id: q.id, answer: btn.textContent, attempt });
+    const r = await api(`chapters/${q.chapter_id || S.chapter.id}/answer`, { learner_id: S.learner, session_id: S.session, question_id: q.id, answer, attempt });
     if (r.follow_up) return renderQuestion(attempt + 1, r.hint);
     const fb = document.getElementById("fb");
     if (r.result === "correct") {
       if (attempt === 1) S.quiz.right++;
-      btn.classList.add("right"); fb.innerHTML = `<div class="feedback ok">Correct!</div>`; return nextQuestion();
+      els.forEach((b) => b.classList?.add("right")); mascot("cheer"); fb.innerHTML = `<div class="feedback ok">Correct!${r.explanation ? ` ${esc(r.explanation)}` : ""}</div>`; return nextQuestion();
     }
-    btn.classList.add("wrong");
+    els.forEach((b) => b.classList?.add("wrong"));
     const why = r.misconception ? `<p>It looks like: <strong>${esc(r.misconception)}</strong></p>` : "";
+    const partial = r.result === "partial" ? `<p>Partly right.</p>` : "";
     if (attempt === 1) {
-      fb.innerHTML = `<div class="feedback bad">${why}<p>Hint: ${esc(r.hint)}</p></div><button class="btn block" id="retry">Try again</button>`;
+      mascot("oops");
+      fb.innerHTML = `<div class="feedback bad">${partial}${why}<p>Hint: ${esc(r.hint)}</p></div><button class="btn block" id="retry">Try again</button>`;
       document.getElementById("retry").onclick = () => renderQuestion(2, r.hint);
     } else {
-      document.querySelectorAll(".option").forEach((b) => { if (b.textContent === r.correct_answer) b.classList.add("right"); });
-      fb.innerHTML = `<div class="feedback bad">${why}<p>Answer: ${esc(r.correct_answer)}</p></div>`; nextQuestion();
+      document.querySelectorAll(".option").forEach((b) => { if (String(r.correct_answer).split(", ").includes(b.textContent) || b.textContent === r.correct_answer) b.classList.add("right"); });
+      mascot("oops", r.misconception ? "I'll bring this one back in your review." : undefined);
+      fb.innerHTML = `<div class="feedback bad">${partial}${why}<p>Answer: ${esc(r.correct_answer)}</p>${r.explanation ? `<p>${esc(r.explanation)}</p>` : ""}</div>`; nextQuestion();
     }
-  } catch (e) { fail(e); }
+  } catch (e) { fail(e); el_disable(false); }
 }
+const el_disable = (d) => document.querySelectorAll("#quiz .option, #quiz #check, #quiz #fillin, #quiz .ordbtns button").forEach((b) => (b.disabled = d));
 
 function nextQuestion() {
   const last = S.quiz.i === S.quiz.qs.length - 1;
-  document.getElementById("fb").insertAdjacentHTML("beforeend", `<button class="btn block" id="nq">${last ? "Finish chapter" : "Next question"}</button>`);
-  document.getElementById("nq").onclick = () => { if (last) finishQuiz(); else { S.quiz.i++; renderQuestion(1, ""); } };
+  document.getElementById("fb").insertAdjacentHTML("beforeend", `<button class="btn block" id="nq">${last ? (S.quiz.retake ? "See result" : "Finish chapter") : "Next question"}</button>`);
+  document.getElementById("nq").onclick = () => { if (last) (S.quiz.retake ? finishRetake() : finishQuiz()); else { S.quiz.i++; renderQuestion(1, ""); } };
+  document.getElementById("nq").focus();
+}
+
+function finishRetake() {
+  const { right, qs } = S.quiz, el = document.getElementById("quiz");
+  el.innerHTML = `${mascotHtml()}<div class="card"><div class="score">${right} of ${qs.length} right this time</div><p class="muted">Practice only: your chapter result is unchanged.</p></div>`;
+  mascot(right === qs.length ? "proud" : "idle", right === qs.length ? "That's the lot. Well done." : "Getting there. The notes have what you need.");
 }
 
 async function finishQuiz() {
@@ -605,9 +772,18 @@ async function finishQuiz() {
   try {
     const r = await api(`chapters/${S.chapter.id}/finish`, { learner_id: S.learner, session_id: S.session });
     S.nb = r.notebook; renderHead(); renderSide();
+    const m = r.marks;
+    const proposed = (r.proposed || []).length ? `<p>${esc(r.reason)}</p>` : "";
     const added = r.added.length ? `<p>Your course changed: ${esc(r.reason)}</p><ul>${r.added.map((a) => `<li><button class="linkbtn" data-go="${a.id}">${esc(a.title)}</button></li>`).join("")}</ul>` : "<p>Your course stays the same.</p>";
-    el.innerHTML = `<div class="card"><div class="score">${r.score.correct} of ${r.score.total} right first time</div>${added}</div>`;
+    const rows = m ? `<ul class="marks">${m.by_concept.map((c) => `<li><span>${esc(c.concept)}</span><span class="bar" role="img" aria-label="${c.percent} percent"><i style="width:${c.percent}%"></i></span><span class="pc">${c.percent}%</span></li>`).join("")}</ul>` : "";
+    const retake = m && m.missed.length ? `<button class="btn" id="retake">Retake only the ${m.missed.length} you missed</button>` : "";
+    el.innerHTML = `${mascotHtml()}<div class="card"><div class="score">${m ? `${m.percent}%` : `${r.score.correct} of ${r.score.total}`} <span class="muted">${m ? (m.passed ? "· passed" : "· not yet at 70%") : "right first time"}</span></div>
+      ${rows}${m && m.weakest.length ? `<p class="muted">Worth another look: ${m.weakest.map(esc).join(", ")}</p>` : ""}${retake}${proposed || added}</div>`;
+    if ((r.proposed || []).length) S.chat?.refresh?.();
+    mascot(m && m.passed ? "proud" : "oops", m && m.passed ? undefined : "Let's look at the tricky parts again. I'll remember them.");
     el.querySelectorAll("[data-go]").forEach((b) => b.onclick = () => loadChapter(Number(b.dataset.go)));
+    const rb = el.querySelector("#retake");
+    if (rb) rb.onclick = () => { const all = S.chapter.blocks.find((b) => b.type === "quiz").content.questions; startQuiz(all.filter((q) => m.missed.includes(q.id)), true); };
   } catch (e) { fail(e); }
 }
 

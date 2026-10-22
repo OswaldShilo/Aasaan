@@ -340,6 +340,33 @@ def discover_wikipedia(query: str, n: int = 3) -> list[Candidate]:
     return [Candidate(f"w{i}", "link", h["url"], h["title"], "wikipedia.org") for i, h in enumerate(res.value_or({}).get("hits", []))]
 
 
+def discover_books(query: str, n: int = 5) -> list[Candidate]:
+    """Real books on a topic from Open Library (free, no key). Each Candidate is a book page you can open, with its facts in `extra`
+    (authors, year, subjects, and an Internet Archive id when a copy can be read online). Nothing here is copied from the books."""
+    def search():
+        data = _json(http_get("https://openlibrary.org/search.json", params={
+            "q": query, "limit": max(n * 3, 10), "fields": "key,title,author_name,first_publish_year,subject,first_sentence,ia,edition_count,language"}), "openlibrary search")
+        return {"docs": data.get("docs", [])}
+
+    res = tool("openlibrary", search, cache_key=f"books:{n}:{query.lower()}", summary=f"open library books '{query[:40]}'")
+    docs = [d for d in res.value_or({}).get("docs", []) if d.get("key") and d.get("title")]
+    docs.sort(key=lambda d: -(d.get("edition_count") or 0))             # widely published books first
+    out, seen = [], set()
+    for d in docs:
+        t = d["title"].strip().lower()
+        if t in seen:
+            continue
+        seen.add(t)
+        sentence = d.get("first_sentence")
+        sentence = sentence[0] if isinstance(sentence, list) and sentence else (sentence if isinstance(sentence, str) else "")
+        out.append(Candidate(f"b{len(out)}", "book", "https://openlibrary.org" + d["key"], d["title"].strip(), "openlibrary.org",
+                             extra={"authors": (d.get("author_name") or [])[:3], "year": d.get("first_publish_year"), "subjects": [s for s in (d.get("subject") or []) if len(s) < 40][:6],
+                                    "first_sentence": sentence[:240], "ia": (d.get("ia") or [""])[0]}))
+        if len(out) >= n:
+            break
+    return out
+
+
 def discover_youtube(query: str, n: int = 4) -> list[Candidate]:
     def search():
         data = _json(http_get("https://www.googleapis.com/youtube/v3/search", params={

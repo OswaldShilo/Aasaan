@@ -1,8 +1,9 @@
 // Chat panel for a notebook: persistent thread (SQLite), code-written progress narration, streamed answers with source chips,
 // attachments with upload progress, "Ask about this" context, unread dot. The thread is delivered by cursor (messages?after=id),
 // so a dropped stream or a reload never loses a message.
-import { esc, ICON } from "./util.js";
+import { esc, ICON, store } from "./util.js";
 import { logoSvg } from "./pixel-mascot.js";
+import { renderMarkdown } from "./markdown.js";
 
 const fmtSize = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
 const STATUS = { reading: "Reading…", ready: "Read", partly_readable: "Partly readable", unreadable: "Couldn't read" };
@@ -12,7 +13,14 @@ export function createChat(ctx) {
   const el = { msgs: document.getElementById("msgs"), input: document.getElementById("chatinput"), send: document.getElementById("chatsend"),
                atts: document.getElementById("chatatts"), ctx: document.getElementById("ctxrow"), file: document.getElementById("chatfile"),
                pane: document.getElementById("chatpane") };
-  const st = { lastId: 0, seen: new Set(), files: [], context: [], busy: false, stick: true, seq: 0, cards: new Map() };
+  const st = { lastId: 0, seen: new Set(), files: [], context: [], busy: false, stick: true, seq: 0, cards: new Map(), guide: store.get("guide") === "1" };
+  // "Just tell me" answers directly; "Guide me" gives a hint and a question first. Remembered in this browser.
+  const modeRow = document.getElementById("moderow");
+  if (modeRow) {
+    const paint = () => modeRow.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String((b.dataset.m === "guide") === st.guide)));
+    modeRow.querySelectorAll("button").forEach((b) => b.onclick = () => { st.guide = b.dataset.m === "guide"; store.set("guide", st.guide ? "1" : "0"); paint(); });
+    paint();
+  }
 
   // ------------------------------------------------------------------ rendering
   const attHtml = (list) => (list || []).map((a) => {
@@ -21,6 +29,12 @@ export function createChat(ctx) {
     return `<span class="attchip" data-n="${esc(a.name)}">${a.kind === "image" ? ICON.doc : ICON.doc}<span class="nm">${esc(String(a.name).slice(0, 36))}</span>
       ${a.size ? `<span class="sz">${fmtSize(a.size)}</span>` : ""}${status ? `<span class="st">${status}</span>` : ""}</span>`;
   }).join("");
+  // an assistant answer: Markdown and math, with [n] turned into a button that opens the n-th source (the chips carry the number)
+  const botHtml = (text, refs) => {
+    const nums = new Map((refs || []).map((r, i) => [r.n, i]).filter(([n]) => n));
+    const html = renderMarkdown(text);
+    return nums.size ? html.replace(/\[(\d{1,2})\](?![^<]*<\/(?:code|a|button)>)/g, (m, n) => nums.has(Number(n)) ? `<sup class="cite"><button class="srcchip cite" data-chip="${nums.get(Number(n))}" type="button" aria-label="Source ${n}">[${n}]</button></sup>` : m) : html;
+  };
   const chipsHtml = (refs) => (refs || []).length ? `<div class="chips">${refs.map((r, i) => `<button class="srcchip" data-chip="${i}" type="button">${r.kind === "chapter" ? "Chapter · " : r.kind === "resource" ? "" : "Web · "}${esc(r.label)}</button>`).join("")}</div>` : "";
 
   // proposal card: a plain summary, what Apply will do, and buttons that follow its state (pending, applied, undone, dismissed)
@@ -68,8 +82,8 @@ export function createChat(ctx) {
     }
     const avatar = m.role === "user" || m.kind === "system" ? "" : `<span class="pul" aria-hidden="true">${logoSvg()}</span>`;
     if (m.created_at) row.title = clock(m.created_at);
-    row.innerHTML = `${avatar}<div class="msgcol"><div class="msg ${m.role === "user" ? "user" : m.kind === "system" ? "sys" : "bot"}">${esc(m.content).replace(/\n/g, "<br>")}${m.role === "user" ? attHtml(m.attachments) : ""}</div>${chipsHtml(m.refs)}</div>`;
-    row.querySelectorAll(".srcchip").forEach((b) => b.onclick = () => ctx.onChip(m.refs[Number(b.dataset.chip)]));
+    row.innerHTML = `${avatar}<div class="msgcol"><div class="msg ${m.role === "user" ? "user" : m.kind === "system" ? "sys" : "bot"}">${m.role === "assistant" && m.kind === "chat" ? botHtml(m.content, m.refs) : esc(m.content).replace(/\n/g, "<br>")}${m.role === "user" ? attHtml(m.attachments) : ""}</div>${chipsHtml(m.refs)}</div>`;
+    row.querySelectorAll(".srcchip").forEach((b) => b.onclick = () => ctx.onChip(m.refs[Number(b.dataset.chip)]));      // chips and [n] citations
     if (m.role === "assistant" && m.kind === "chat" && m.content) addCopy(row, m.content);
     return row;
   }
@@ -150,7 +164,7 @@ export function createChat(ctx) {
     const text = el.input.value.trim(); if (st.busy || !(text || st.files.length)) return;
     st.busy = true; sync2();
     const form = new FormData();
-    form.append("learner_id", ctx.learner); form.append("text", text);
+    form.append("learner_id", ctx.learner); form.append("text", text); form.append("mode", st.guide ? "guide" : "answer");
     const ch = ctx.getChapterId(); if (ch) form.append("chapter_id", String(ch));
     if (st.context.length) form.append("block_ids", st.context.map((c) => c.id).join(","));
     st.files.forEach((f) => form.append("files", f));
@@ -167,8 +181,8 @@ export function createChat(ctx) {
       if (name === "user") { mine.dataset.id = d.id; st.seen.add(d.id); st.lastId = Math.max(st.lastId, d.id); mine.querySelectorAll(".attchip .st").forEach((s) => (s.textContent = "Reading…")); }
       else if (name === "status") showTyping(d.text);
       else if (name === "proposal") { typing?.remove(); typing = null; st.seen.add(d.id); st.lastId = Math.max(st.lastId, d.id); const pr = bubble({ role: "assistant", kind: "proposal", id: d.id, proposal: d.proposal }); pr.classList.add("enter"); place(pr); scrollEnd(true); }
-      else if (name === "delta") { if (!botEl) { typing?.remove(); typing = null; botEl = bubble({ role: "assistant", kind: "chat", content: "" }); botEl.classList.add("enter"); place(botEl); } botText += d.text; botEl.querySelector(".msg").innerHTML = esc(botText).replace(/\n/g, "<br>"); scrollEnd(); }
-      else if (name === "done") { done = true; if (botEl && d.id) { st.seen.add(d.id); st.lastId = Math.max(st.lastId, d.id); botEl.dataset.id = d.id; addCopy(botEl, botText); const col = botEl.querySelector(".msgcol"); col.insertAdjacentHTML("beforeend", chipsHtml(d.refs)); col.querySelectorAll(".srcchip").forEach((b) => b.onclick = () => ctx.onChip(d.refs[Number(b.dataset.chip)])); } scrollEnd(); }
+      else if (name === "delta") { if (!botEl) { typing?.remove(); typing = null; botEl = bubble({ role: "assistant", kind: "chat", content: "" }); botEl.classList.add("enter"); place(botEl); } botText += d.text; botEl.querySelector(".msg").innerHTML = renderMarkdown(botText); scrollEnd(); }
+      else if (name === "done") { done = true; if (botEl && d.id) { st.seen.add(d.id); st.lastId = Math.max(st.lastId, d.id); botEl.dataset.id = d.id; addCopy(botEl, botText); botEl.querySelector(".msg").innerHTML = botHtml(botText, d.refs); const col = botEl.querySelector(".msgcol"); col.insertAdjacentHTML("beforeend", chipsHtml(d.refs)); botEl.querySelectorAll(".srcchip").forEach((b) => b.onclick = () => ctx.onChip(d.refs[Number(b.dataset.chip)])); } scrollEnd(); }
       else if (name === "error") { errored = true; typing?.remove(); typing = null; add({ role: "assistant", kind: "chat", content: d.content, id: d.id }); }
     };
     const finish = () => { st.busy = false; typing?.remove(); sync2(); sync(); el.input.focus(); };

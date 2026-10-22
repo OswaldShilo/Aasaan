@@ -12,7 +12,8 @@ from ..router import ModelRouter, RouterResult
 from ..schemas import MAX_CHAPTERS_AFTER_PATCH, MIN_CHAPTERS
 from .common import build_prompt
 
-OPS = ("add_chapter", "remove_chapter", "move_chapter", "regenerate_chapter", "set_level")
+OPS = ("add_chapter", "remove_chapter", "move_chapter", "regenerate_chapter", "set_level", "set_scope")
+SCOPE_DEPTHS = ("quick", "standard", "deep")
 LEVELS = ("beginner", "intermediate", "advanced")
 MAX_OPS = 4
 EXAMPLE = {"ops": [
@@ -66,7 +67,8 @@ def validate_ops(raw_ops: list, outline: list[dict], level: str) -> list[dict]:
             key = f"new{new_n}"
             cur.insert(at, {"key": key, "title": title, "pre": {after_id} if after_id else set()})
             ops.append({"op": "add_chapter", "after_id": after_id, "title": title[:80], "summary": str(o.get("summary") or "")[:240], "objectives": objs,
-                        "minutes": max(5, min(60, _int(o.get("minutes", 12), "minutes"))), "key": key})
+                        "minutes": max(5, min(60, _int(o.get("minutes", 12), "minutes"))), "key": key,
+                        **({"review_for": str(o["review_for"])[:80], "session": str(o.get("session") or "")[:64]} if o.get("review_for") else {})})
         elif kind in ("remove_chapter", "move_chapter", "regenerate_chapter"):
             pos = _int(o.get("chapter"), "chapter")
             if not 1 <= pos <= N:
@@ -96,6 +98,16 @@ def validate_ops(raw_ops: list, outline: list[dict], level: str) -> list[dict]:
                 ops.append({"op": "move_chapter", "chapter_id": key, "after_id": target})
             else:
                 ops.append({"op": "regenerate_chapter", "chapter_id": key, "focus": str(o.get("focus") or "").strip()[:120]})
+        elif kind == "set_scope":        # built by code (the Scoper), never proposed by the Editor model; `affected_ids` are the chapters it would rewrite
+            depth, lv = o.get("depth"), o.get("level")
+            if depth is not None and depth not in SCOPE_DEPTHS:
+                raise ValueError(f"depth must be one of {', '.join(SCOPE_DEPTHS)}")
+            if lv is not None and lv not in LEVELS:
+                raise ValueError(f"level must be one of {', '.join(LEVELS)}")
+            if depth is None and lv is None:
+                raise ValueError("a scope change needs a depth or a level")
+            valid = {c["id"] for c in outline}
+            ops.append({"op": "set_scope", "depth": depth, "level": lv, "affected_ids": [i for i in (o.get("affected_ids") or []) if i in valid], "minutes": int(o.get("minutes") or 0)})
         else:  # set_level
             lv = str(o.get("level") or "").lower()
             if lv not in LEVELS:
@@ -127,6 +139,10 @@ def describe(op: dict, outline: list[dict]) -> str:
         return f'Move chapter {pos.get(op["chapter_id"], "?")} "{title.get(op["chapter_id"], "")[:40]}" {"after chapter " + str(a) if a else "to the start"}'
     if op["op"] == "regenerate_chapter":
         return f'Rewrite chapter {pos.get(op["chapter_id"], "?")} "{title.get(op["chapter_id"], "")[:40]}"' + (f' with a focus on {op["focus"]}' if op.get("focus") else "")
+    if op["op"] == "set_scope":
+        bits = [b for b in (f"depth to {op['depth']}" if op.get("depth") else "", f"level to {op['level']}" if op.get("level") else "") if b]
+        n = len(op.get("affected_ids") or [])
+        return f"Change the {' and '.join(bits)}." + (f" {n} chapter{'s' if n != 1 else ''} you have not started would be rewritten (about {op.get('minutes', 0)} min). The rest stay as they are." if n else " Chapters yet to be written will follow it.")
     return f'Change the level to {op["level"]}'
 
 

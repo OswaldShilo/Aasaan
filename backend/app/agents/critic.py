@@ -45,9 +45,12 @@ def run(router: ModelRouter, content: ChapterContent, chunks: list[dict], profil
 
     # claim_support gate: only claims the sources do not support go to the Critic model. All supported -> code checks only.
     flagged = gates.claim_support(router, content.notes_md, chunks)
+    total = len(gates.claim_sentences(content.notes_md)) if flagged is not None else None
     if flagged is not None and not flagged:
         router.note("critic", "ok", "claim_support: every claim is supported; Critic model not needed", "code checks (refs, length, leaks, verbatim) still ran")
-        return RouterResult(rule_checks(content, chunks, allowed_extra), "claim_support", 0)
+        out = rule_checks(content, chunks, allowed_extra)
+        out.claims_total, out.claims_flagged = total, 0
+        return RouterResult(out, "claim_support", 0)
     if flagged:
         router.note("critic", "ok", f"claim_support flagged {len(flagged)} claim(s) for the Critic", "; ".join(c[:60] for c in flagged[:3]))
 
@@ -61,5 +64,8 @@ def run(router: ModelRouter, content: ChapterContent, chunks: list[dict], profil
         "Teacher can fix it. Do not rewrite the content. 'reject' needs at least one issue.",
         example, {"flagged_claims": flagged, "chapter_content": ctx["content"], "source_chunks": [{"id": c["chunk_id"], "text": c["text"]} for c in chunks],
                   "level": profile.level, "student_language": lang_name(profile.language)})
-    return router.call("critic", prompt, ctx, validate,
-                       last_resort=lambda c: rule_checks(content, chunks, allowed_extra), summary="Critic review of chapter")
+    res = router.call("critic", prompt, ctx, validate,
+                      last_resort=lambda c: rule_checks(content, chunks, allowed_extra), summary="Critic review of chapter")
+    if flagged is not None:
+        res.value.claims_total, res.value.claims_flagged = total, len(flagged)
+    return res

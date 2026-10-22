@@ -230,6 +230,11 @@ class FakeProvider(Provider):
         return {"message": msg, "suggested_next": c.get("suggested_next"),
                 "memory_updates": {"mistake_labels_add": [], "last_chapter": c.get("last_chapter")}}
 
+    # ---- Slides -----------------------------------------------------------
+    def _slides(self, c: dict) -> dict:
+        title, kinds = str(c.get("chapter") or "Chapter"), ["title", "concept", "example", "comparison", "diagram", "mistake", "check", "recap"]
+        return {"slides": [{"type": k, "title": f"{title}: {k} {i}", "points": [f"A distinct {k} point number {i} for {title}", f"Another {k} idea {i} for learners"]} for i, k in enumerate(kinds, 1)]}
+
     # ---- Doubt ------------------------------------------------------------
     def _doubt(self, c: dict) -> dict:
         chunks = c.get("chunks", [])

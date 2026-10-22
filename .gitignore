@@ -1,4 +1,7 @@
 .env
+.env.*
+*.env
+env
 data/*.db
 data/*.db-*
 data/*.log
@@ -9,3 +12,5 @@ __pycache__/
 node_modules/
 backups/
 data/uploads/
+eval/indra/fixtures/
+eval/indra/out/

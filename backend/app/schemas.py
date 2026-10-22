@@ -10,7 +10,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MIN_CHAPTERS, MAX_CHAPTERS = 3, 20
-MAX_NOTES_CHARS = 7000
+MAX_NOTES_CHARS = 14000          # the deep profile asks for about 1,800 words
 MAX_MESSAGE_CHARS = 400
 MAX_INSERTS_PER_SESSION = 2
 MAX_CHAPTERS_AFTER_PATCH = 24
@@ -142,21 +142,34 @@ class Slide(Strict):
         return self
 
 
+class NoteSection(Strict):
+    kind: Literal["why_it_matters", "key_terms", "explanation", "worked_example", "common_mistakes", "recap", "go_deeper"]
+    body: str
+
+
 class ChapterContent(Strict):
-    notes_md: str
+    notes_md: str = ""
     slides: list[Slide]
     key_points: list[str] = Field(default_factory=list)
     summary: str
     source_refs: list[str] = Field(default_factory=list)
+    sections: list[NoteSection] = Field(default_factory=list)       # typed notes: code renders them into notes_md (readability.render_sections)
+    common_mistakes: list[str] = Field(default_factory=list)        # become the Diagnoser's misconception labels
 
     @model_validator(mode="after")
     def _check(self):
+        if self.sections and not self.notes_md.strip():
+            from .readability import render_sections
+            kinds = {s.kind for s in self.sections}
+            if "explanation" not in kinds:
+                raise ValueError("typed notes need an explanation section")
+            self.notes_md = render_sections([s.model_dump() for s in self.sections])
         if len(self.notes_md.strip()) < 120:
             raise ValueError("notes are too short")
         if len(self.notes_md) > MAX_NOTES_CHARS:
             raise ValueError("notes are over the length cap")
-        if not 3 <= len(self.slides) <= 8:
-            raise ValueError(f"need 3-8 slides, got {len(self.slides)}")
+        if not 3 <= len(self.slides) <= 16:
+            raise ValueError(f"need 3-16 slides, got {len(self.slides)}")
         if not self.summary.strip():
             raise ValueError("summary is empty")
         return self
@@ -173,6 +186,8 @@ class CriticOut(Strict):
     verdict: Literal["approve", "revise", "reject"]
     issues: list[CriticIssue] = Field(default_factory=list)
     confidence: float = 0.5
+    claims_total: Optional[int] = None      # set by code (not the model): how many claim sentences the notes made...
+    claims_flagged: Optional[int] = None    # ...and how many the sources did not support (None when the gate could not run)
 
     @model_validator(mode="after")
     def _check(self):
@@ -186,20 +201,34 @@ class CriticOut(Strict):
 # -------------------------------------------------------------------- Quizzer
 class Question(Strict):
     id: str
-    type: Literal["mcq"] = "mcq"
+    type: Literal["mcq", "multi", "order", "fill_blank"] = "mcq"
     text: str
-    options: list[str]
+    options: list[str] = Field(default_factory=list)
     answer_key: str
     concept: str
     hint: str
     source_ref: Optional[str] = None
+    difficulty: int = 1                    # 1 easy, 2 medium, 3 hard: points are weighted by it
+    objective: Optional[str] = None        # which chapter objective this tests (the results screen groups by it)
+    explanation: str = ""                  # shown after the answer, with the misconception named by the Diagnoser
 
     @model_validator(mode="after")
     def _check(self):
-        if len(self.options) < 2 or len(set(self.options)) != len(self.options):
-            raise ValueError(f"{self.id}: options must be unique, at least 2")
-        if resolve_key(self) is None:
-            raise ValueError(f"{self.id}: answer_key does not match exactly one option")
+        if self.difficulty not in (1, 2, 3):
+            raise ValueError(f"{self.id}: difficulty is 1, 2 or 3")
+        if self.type == "fill_blank":
+            if not self.answer_key.strip():
+                raise ValueError(f"{self.id}: fill_blank needs at least one accepted answer")
+        elif self.type in ("multi", "order"):
+            keys = [k.strip() for k in self.answer_key.split("||") if k.strip()]
+            need = 2 if self.type == "multi" else 3
+            if len(self.options) < need + (1 if self.type == "multi" else 0) or len(set(self.options)) != len(self.options) or len(keys) < need or any(k not in self.options for k in keys):
+                raise ValueError(f"{self.id}: {self.type} needs unique options and an answer_key made of those options joined by ' || '")
+        else:
+            if len(self.options) < 2 or len(set(self.options)) != len(self.options):
+                raise ValueError(f"{self.id}: options must be unique, at least 2")
+            if resolve_key(self) is None:
+                raise ValueError(f"{self.id}: answer_key does not match exactly one option")
         if not self.concept.strip() or not self.hint.strip():
             raise ValueError(f"{self.id}: concept and hint are required")
         return self
@@ -222,8 +251,8 @@ class QuizOut(Strict):
 
     @model_validator(mode="after")
     def _check(self):
-        if not 3 <= len(self.questions) <= 5:
-            raise ValueError("quiz must have 3-5 questions")
+        if not 3 <= len(self.questions) <= 12:
+            raise ValueError("quiz must have 3-12 questions")
         ids = [q.id for q in self.questions]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate question ids")
@@ -296,6 +325,8 @@ class CompanionOut(Strict):
 class DoubtOut(Strict):
     answer: str
     source_refs: list[str] = Field(default_factory=list)
+    covered: bool = True                  # False: the notebook's material does not answer this (the engine may then look it up online)
+    quote: str = ""                       # the exact source sentence the answer rests on (checked in code: dropped if it is not really in a source)
 
     @field_validator("answer")
     @classmethod

@@ -235,7 +235,9 @@ def test_wrong_answer_names_misconception_and_adds_a_review_chapter(engine, work
     for other in list(keys)[1:]:
         engine.answer(LID, sid, ids[0], other, keys[other]["answer_key"])
     out = engine.finish_chapter(LID, sid, ids[0])
-    assert out["score"] == {"correct": len(keys) - 1, "total": len(keys)} and len(out["added"]) == 1
+    assert out["score"] == {"correct": len(keys) - 1, "total": len(keys)} and len(out["proposed"]) == 1 and out["added"] == []     # the Rewriter proposes
+    assert len(engine.notebook_view(nid)["chapters"]) == 8                                                                       # nothing changes until Apply
+    engine.apply_proposal(nid, out["proposed"][0]["id"])
     v = engine.notebook_view(nid)
     assert len(v["chapters"]) == 9 and v["chapters"][1]["kind"] == "review" and v["chapters"][1]["title"].startswith("Review:")
     assert v["chapters"][0]["state"] == "needs_review"
@@ -265,7 +267,7 @@ def test_wrong_then_right_after_hint_still_counts_as_a_gap(engine, worker, store
     for qid, q in list(keys.items())[1:]:
         engine.answer(LID, sid, ids[0], qid, q["answer_key"])
     out = engine.finish_chapter(LID, sid, ids[0])
-    assert out["score"]["correct"] == len(keys) - 1 and len(out["added"]) == 1
+    assert out["score"]["correct"] == len(keys) - 1 and len(out["proposed"]) == 1
 
 
 def test_perfect_quiz_changes_nothing(engine, worker, store):
@@ -289,7 +291,9 @@ def test_at_most_two_review_chapters_per_session(engine, worker, store):
         keys = quiz_keys(store, cid)
         q = next(iter(keys.values()))
         engine.answer(LID, sid, cid, q["id"], next(o for o in q["options"] if o != q["answer_key"]))
-        added += engine.finish_chapter(LID, sid, cid)["added"]
+        for pr in engine.finish_chapter(LID, sid, cid)["proposed"]:
+            engine.apply_proposal(nid, pr["id"])                                    # the Rewriter only proposes; applying is the learner's choice
+            added.append(pr)
     assert len(added) == 2 and len(engine.notebook_view(nid)["chapters"]) == 10
 
 

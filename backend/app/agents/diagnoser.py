@@ -9,22 +9,15 @@ from typing import Optional
 
 from ..providers.typesafe import choice, noul, score
 from ..router import ModelRouter, RouterResult
-from ..schemas import DiagnoserOut, Question, resolve_key
+from ..quiz_grading import correct_text, grade
+from ..schemas import DiagnoserOut, Question
 from .common import build_prompt
 
 LOW_CONFIDENCE = 0.5  # below this the orchestrator asks a follow-up instead of a verdict
 
 
 def is_correct(q: Question, student_answer: str) -> bool:
-    key = resolve_key(q)
-    a = student_answer.strip()
-    if a.lower() == (key or "").lower():
-        return True
-    # a letter answer (A-D) maps to the option at that index
-    if len(a) == 1 and a.isalpha():
-        idx = ord(a.upper()) - ord("A")
-        return idx < len(q.options) and q.options[idx] == key
-    return False
+    return grade(q, student_answer) >= 1.0
 
 
 def _jev_diagnose(router: ModelRouter, q: Question, student_answer: str, known_labels: list[str]) -> Optional[DiagnoserOut]:
@@ -35,7 +28,7 @@ def _jev_diagnose(router: ModelRouter, q: Question, student_answer: str, known_l
         return None
     options = {lab: lab for lab in known_labels[:20]}
     options["other"] = "A mistake that is not in the list"
-    state = {"question": q.text, "options": q.options, "correct_answer": resolve_key(q), "concept": q.concept,
+    state = {"question": q.text, "options": q.options, "correct_answer": correct_text(q), "concept": q.concept,
              "student_answer": student_answer}
     answers = router.decide("diagnoser", state, {
         "correct": noul("Is the student's answer correct for this question?"),
@@ -58,10 +51,13 @@ def _jev_diagnose(router: ModelRouter, q: Question, student_answer: str, known_l
 
 
 def run(router: ModelRouter, q: Question, student_answer: str, known_labels: list[str]) -> RouterResult:
-    if is_correct(q, student_answer):
+    g = grade(q, student_answer)
+    if g >= 1.0:
         # Code-graded; no model call needed.
         out = DiagnoserOut(question_id=q.id, result="correct", misconception=None, confidence=1.0, hint="")
         return RouterResult(out, "code", 0)
+    if 0 < g < 1:                      # part of a multi-select or an ordering is right: partial credit, graded in code too
+        return RouterResult(DiagnoserOut(question_id=q.id, result="partial", misconception=None, confidence=1.0, hint=q.hint), "code", 0)
     jev = _jev_diagnose(router, q, student_answer, known_labels)
     if jev:
         return RouterResult(jev, "jev", 0)

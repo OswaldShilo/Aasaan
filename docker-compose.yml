@@ -1,61 +1,72 @@
-# Aasaan on a single small server: app + Caddy (automatic HTTPS) + nightly SQLite backup.
-# Usage: cp .env.example .env  (fill it in), then:  docker compose up -d --build
-# See DEPLOY.md for the exact steps.
+# Aasaan on ONE small VM (AWS Lightsail, 2 GB): app + Caddy (automatic HTTPS) + SQLite backups.
+# SQLite means exactly one app instance. Never scale `app`.
+# Usage:  cp .env.example .env   (fill it in, set AASAAN_DOMAIN)   then:  docker compose up -d --build
+# Steps, DNS, firewall, backup restore and rollback: DEPLOY-LIGHTSAIL.md
+name: aasaan
+
+x-app-image: &app-image aasaan:latest
+
 services:
   app:
-    build: .
-    image: aasaan:latest
+    build:
+      context: .
+      args:
+        WITH_INDRA: "0"          # offline OCR is not wired into the live flow and adds ~0.5 GB; the vision model covers scans
+    image: *app-image
     container_name: aasaan-app
     restart: unless-stopped
     env_file: .env
     environment:
       AASAAN_DB: /app/data/aasaan.db
       AASAAN_UPLOADS: /app/data/uploads
+      AASAAN_BACKUP_DIR: /app/data/backups
+      AASAAN_TRUSTED_PROXY_HOPS: "1"     # exactly one proxy (Caddy) in front: rate limits use the real client IP
+    # If there is no database yet, restore the newest valid backup; otherwise this is a no-op. Then start the server.
+    command: ["sh", "-c", "python -m app.restore && exec python -m uvicorn app.main:create_app --factory --app-dir backend --host 0.0.0.0 --port 8000 --workers 1"]
     volumes:
       - aasaan-data:/app/data
     expose:
-      - "8000"
-    deploy:
-      replicas: 1   # SQLite: exactly one app instance
+      - "8000"                           # private: reachable only by Caddy on the compose network, never published to the host
+    mem_limit: 1200m
+    stop_grace_period: 30s
+
+  backup:
+    image: *app-image
+    container_name: aasaan-backup
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      AASAAN_DB: /app/data/aasaan.db
+      AASAAN_BACKUP_DIR: /app/data/backups
+    # SQLite online-backup API on the live database, integrity-checked, atomic rename, old files pruned (newest 3 always kept).
+    command: ["python", "-m", "app.backup_loop"]
+    volumes:
+      - aasaan-data:/app/data
+    mem_limit: 256m
+    healthcheck:
+      disable: true
 
   caddy:
     image: caddy:2
     container_name: aasaan-caddy
     restart: unless-stopped
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
     environment:
       AASAAN_DOMAIN: ${AASAAN_DOMAIN:-localhost}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-
-  backup:
-    image: alpine:3
-    container_name: aasaan-backup
-    restart: unless-stopped
-    depends_on:
-      - app
-    volumes:
-      - aasaan-data:/data:ro
-      - ./backups:/backups
-    # Runs once at start, then every 24 h. Uses SQLite's online backup, safe while the app is running.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        apk add --no-cache sqlite >/dev/null
-        while true; do
-          if [ -f /data/aasaan.db ]; then
-            f=/backups/aasaan-$$(date +%Y-%m-%d).db
-            sqlite3 /data/aasaan.db ".backup '$$f'" && echo "backup written: $$f"
-            find /backups -name 'aasaan-*.db' -mtime +14 -delete
-          fi
-          sleep 86400
-        done
+    mem_limit: 192m
 
 volumes:
   aasaan-data:

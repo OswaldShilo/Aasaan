@@ -10,6 +10,8 @@ from typing import Optional
 
 from ..db import Store
 from ..router import ModelRouter, RouterResult
+import os
+
 from ..schemas import ChapterContent, LearnerProfile
 from .common import build_prompt, fingerprint, lang_name, split_sentences
 
@@ -54,6 +56,7 @@ def run(
     issues: Optional[list[dict]] = None,
     previous: Optional[dict] = None,
     store: Optional[Store] = None,
+    depth: Optional[dict] = None,
 ) -> RouterResult:
     """chunks: material the notes may rest on (student's chunks + fetched page chunks).
     link_refs: verified resources the notes may point to: [{"ref": "url:...", "title", "source"}]."""
@@ -113,9 +116,19 @@ def run(
     example = {"language": profile.language, "notes_md": "## Heading\n\nShort paragraphs in your own words. Use lists and **bold** for key terms.",
                "slides": [{"title": "Slide title", "points": ["Short point", "Short point"]}],
                "key_points": ["..."], "summary": "Two or three sentences.", "source_refs": ["<an allowed ref>"]}
+    depth = depth or {"words": 600, "examples": 1, "slides": 6}
+    typed = os.environ.get("AASAAN_TYPED_NOTES", "on").strip().lower() not in ("off", "0", "false", "no")
+    if typed:
+        notes_ask = (f"Produce `sections` (about {depth['words']} words in total, own words, one idea per paragraph, short sentences, plain language): a list of "
+                     "{kind, body} with these kinds in this order: why_it_matters (why a learner needs this), key_terms (one `term: meaning` per line), explanation, "
+                     f"worked_example ({depth['examples']} example{'s' if depth['examples'] != 1 else ''}, step by step), common_mistakes (one per line: what learners get wrong and why), "
+                     "recap (3-4 sentences), and optionally go_deeper. Leave `notes_md` empty. Also return `common_mistakes` as a short list of labels. ")
+        example = {**example, "notes_md": "", "sections": [{"kind": "why_it_matters", "body": "..."}, {"kind": "explanation", "body": "..."}], "common_mistakes": ["..."]}
+    else:
+        notes_ask = f"Produce `notes_md` (markdown, about {depth['words']} words, own words, clear headings, short paragraphs, {depth['examples']} worked example(s)); "
     job = (f"You are Teacher. Write the notes for ONE chapter of a course, for a {profile.level} student. "
-           "Produce: `notes_md` (markdown, 250-600 words, own words, clear headings, short paragraphs, one worked example where useful); "
-           "`slides` (4-8 cards, each a title and 2-4 short points); `key_points`; `summary` (2-3 sentences). "
+           + notes_ask +
+           f"`slides` ({max(4, min(depth['slides'], 16))} cards, each a title and 2-4 short points); `key_points`; `summary` (2-3 sentences). "
            "Use ONLY facts supported by the supplied source chunks and verified resources; never invent facts and never paste "
            "long passages (quote at most a short phrase with attribution). Put the refs you relied on in `source_refs` "
            "(only from allowed_refs). Do not give away quiz answers. "

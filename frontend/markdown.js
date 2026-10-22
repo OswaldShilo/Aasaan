@@ -1,12 +1,13 @@
 // Tiny, safe markdown renderer for chapter notes: escape first, then apply a small set of rules.
 // Supports headings, bold, italic, inline code, code fences, links (http/https only), bullet and numbered lists, paragraphs.
 import { esc } from "./util.js";
+import { typeset } from "./math.js";
 
-const inline = (s) => esc(s)
+const inline = (s) => typeset(esc(s)
   .replace(/`([^`]+)`/g, "<code>$1</code>")
   .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
   .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
-  .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'));
 
 export function renderMarkdown(md) {
   const lines = String(md || "").replace(/\r/g, "").split("\n");

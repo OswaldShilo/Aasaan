@@ -157,12 +157,18 @@ class EventSink:
 
     def __init__(self, store=None, enabled: bool = True):
         self.store, self.enabled = store, enabled
+        self.hook = None          # optional callable(agent, provider, status, summary, error): the activity feed listens here (never raises into a call)
 
     def emit(self, agent: str, provider: str, step: int, status: str, latency_ms: int = 0, validation: str = "pass",
              summary: str = "", error: str = "", run_id: Optional[str] = None) -> None:
         err, summ = scrub(error)[:600], scrub(summary)[:300]
         if status in ("retry", "fallback", "failed"):  # never silent: say WHY in the server log
             log.warning("[aasaan] %s step %d (%s) -> %s: %s", agent, step, provider, status, err or summ)
+        if self.hook is not None:
+            try:
+                self.hook(agent, provider, status, summ, err)
+            except Exception:  # noqa: BLE001  the feed must never break a model call
+                pass
         if self.store and self.enabled:
             self.store.log_event({"run_id": run_id or str(uuid.uuid4()), "ts": datetime.now(timezone.utc).isoformat(), "agent": agent,
                                   "model_used": provider, "fallback_step": step, "status": status, "latency_ms": latency_ms,

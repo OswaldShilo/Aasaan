@@ -205,10 +205,15 @@ def _figure_block(s: Section, topic: str, router: ModelRouter) -> Optional[dict]
 def build_one(router: ModelRouter, store, kind: str, topic: str, s: Section, language: str) -> tuple[Optional[dict], str]:
     """(block or None, how) for one section. `how` goes into the event."""
     if kind == "code_flowchart":
-        d = astflow.code_to_flowchart(s.code or "", f"{s.heading} flow")
-        if d is None:
+        lv = astflow.code_to_levels(s.code or "", f"{s.heading} flow")
+        if lv is None:
             return None, "the code could not be drawn (syntax error or more than 12 steps)"
-        return _svg_block(d, kind, "ast_flowchart", s.heading), "Python AST flowchart, no model call"
+        first = "high" if lv["high"] else "detailed"
+        blk = _svg_block(lv[first], kind, "ast_flowchart", s.heading)
+        blk["content"]["payload"].update({"level": first, "code": lv["code"], "lines": lv["lines"][first],
+                                          "levels": {name: {"svg": render.render(specs.parse_spec(lv[name])).svg, "lines": lv["lines"][name], "alt_text": lv[name]["alt_text"]}
+                                                     for name in ("high", "detailed") if lv[name]}})
+        return blk, "Python AST flowchart (high level and detailed), no model call"
     if kind == "figure":
         blk = _figure_block(s, topic, router)
         return blk, "real figure" if blk else "no licensed figure found"

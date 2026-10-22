@@ -183,6 +183,7 @@ def render_flowchart(spec: FlowchartSpec) -> Rendered:
         else:
             body.append(f'<rect class="{cls}" x="{x0:.1f}" y="{y0:.1f}" width="{w:.1f}" height="{h:.1f}" rx="6"/>')
         body.append(text_block(cx, cy, lines_of[n.id]))
+        body[-2:] = ['<g class="fn" data-n="' + esc(n.id) + '">' + body[-2] + body[-1] + '</g>']       # one group per node: the page links it to the code lines
         boxes.append((x0, y0, w, h, n.label))
         labels.append(n.label)
     return wrap_svg(width, height, "".join(body), spec.title, spec.alt_text, boxes, labels)

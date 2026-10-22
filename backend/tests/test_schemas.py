@@ -67,7 +67,7 @@ def test_question_key_resolution_and_quiz_size():
     with pytest.raises(ValidationError):
         Question(id="q1", text="?", options=["x", "x"], answer_key="x", concept="c", hint="h")
     one = {"id": "q1", "text": "?", "options": ["a", "b"], "answer_key": "a", "concept": "c", "hint": "h"}
-    with pytest.raises(ValidationError, match="3-5"):
+    with pytest.raises(ValidationError, match="3-12"):
         QuizOut.model_validate({"questions": [one]})
 
 

@@ -4,7 +4,7 @@ import { esc, ICON } from "./util.js";
 const fmtSize = (n) => (!n ? "" : n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
 const KIND = { pdf: "PDF", image: "Image", url: "Link", pasted: "Pasted text", text: "Text file" };
 const STATUS = { reading: "Reading…", ready: "Ready", partly_readable: "Partly readable", unreadable: "Unreadable" };
-const FOUND_GROUPS = [["video", "Videos"], ["article", "Articles"], ["image", "Images"]];
+const FOUND_GROUPS = [["video", "Videos"], ["article", "Articles"], ["book", "Books"], ["image", "Images"]];
 
 export function createResources(ctx) {
   // ctx: { nid, api, toast, openChapter(id), isVisible() }
@@ -41,7 +41,7 @@ export function createResources(ctx) {
   }
   function foundCard(f) {
     const credit = [f.author, f.license].filter(Boolean).join(" · ");
-    return `<li class="rcard found">${f.thumb ? `<img class="rthumb" src="${esc(f.thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<span class="rthumb ph">${f.kind === "video" ? "Video" : "Link"}</span>`}
+    return `<li class="rcard found">${f.thumb ? `<img class="rthumb" src="${esc(f.thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<span class="rthumb ph">${f.kind === "video" ? "Video" : f.kind === "book" ? "Book" : "Link"}</span>`}
       <div class="rbody"><div class="rtitle">${f.url ? `<a href="${esc(f.url)}" target="_blank" rel="noopener noreferrer">${esc(f.title || f.url)}</a>` : esc(f.title)}</div>
         <div class="rmeta"><span>${esc(f.source || "")}${credit ? ` · ${esc(credit)}` : ""}</span></div>${usedIn(f.used_in)}</div></li>`;
   }
