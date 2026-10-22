@@ -11,7 +11,11 @@ a complete course with chapters, notes, verified links, videos, images with attr
 The notebook has two views of the same course: a **roadmap** and a **prerequisite graph**. A small swarm of specialised
 agents does the work; the student only sees a clean notebook.
 
-To run it, see **[HOW_TO_RUN.md](HOW_TO_RUN.md)**.
+To run it locally, see **[HOW_TO_RUN.md](HOW_TO_RUN.md)**.
+
+> 🌐 **Live Prototype**: [https://aasaan.purplemoss-02047b9c.centralindia.azurecontainerapps.io/](https://aasaan.purplemoss-02047b9c.centralindia.azurecontainerapps.io/)
+>
+> Deployed on Microsoft Azure Container Apps (Central India). This prototype is active and stays online until Azure cloud credits are maxed out. See [AZURE_DEPLOYMENT_README.md](AZURE_DEPLOYMENT_README.md) for architecture and CI/CD details.
 
 ## How it works
 
@@ -59,6 +63,7 @@ No accounts. A random learner id lives in the browser; memory (mistake labels, p
 
 - [HOW_TO_RUN.md](HOW_TO_RUN.md): install, configure, run, test, Docker
 - [DEPLOY.md](DEPLOY.md): one small server with HTTPS, backups and Azure Container Apps notes
+- [AZURE_DEPLOYMENT_README.md](AZURE_DEPLOYMENT_README.md): Azure Container Apps architecture, SQLite EmptyDir pattern, and GitHub CI/CD deployment guide
 - [build-log/](build-log/): what was built, milestone by milestone, and the Milestone 4 checklist
 - [eval/](eval/): quality baseline and the Indra OCR spike report
 - `PRD.md`, `agents/`, `architecture/`: the original planning documents, kept for reference
