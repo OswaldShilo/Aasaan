@@ -6,6 +6,7 @@ startup validation, directory creation, and non-root writability checks.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional, Union
@@ -13,6 +14,18 @@ from typing import Optional, Union
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = ROOT / "data" / "aasaan.db"
 DEFAULT_UPLOADS_DIR = ROOT / "data" / "uploads"
+
+
+_CONFIG_NAME = re.compile(r"^AASAAN_|_KEY$|_ID$|_SECRET$|_PER_NOTEBOOK$")
+
+
+def drop_empty_env() -> list[str]:
+    """Treat a blank setting (`NAME=`) as unset. `docker compose` env_file passes every blank line of a copied
+    .env.example as an empty string, which would crash int()/float() parsing instead of using the default."""
+    dropped = [k for k, v in os.environ.items() if v.strip() == "" and _CONFIG_NAME.search(k)]
+    for k in dropped:
+        del os.environ[k]
+    return dropped
 
 
 def get_db_path(override: Optional[Union[str, Path]] = None) -> Union[Path, str]:
