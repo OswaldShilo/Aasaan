@@ -1,4 +1,4 @@
-# Aasaan: one small container for Azure Container Apps / Docker.
+# Aasaan: one small container (run by docker-compose.yml on a single VM).
 # SQLite means ONE app instance only (do not scale this service horizontally).
 FROM python:3.12-slim
 

@@ -2,7 +2,6 @@
 .env.*
 *.env
 env
-infra/azure/app.yaml
 data/*.db
 data/*.db-*
 data/*.log

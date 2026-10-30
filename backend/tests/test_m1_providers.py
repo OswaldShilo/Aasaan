@@ -47,9 +47,9 @@ def test_models_yaml_is_consistent(router):
         for step in rc["chain"]:
             assert step in cfg["models"] or step in NON_MODEL_STEPS, f"{role}: unknown step {step}"
     gemini_ids = {m["id"] for m in cfg["models"].values() if m["provider"] == "gemini_api"}
-    assert gemini_ids == {"gemma-4-31b-it", "gemma-4-26b-a4b-it"}  # the only Gemma 4 ids the Gemini API serves
+    assert gemini_ids == {"gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemini-3.8-flash"}  # the Gemma 4 ids plus the Gemini Flash used for resource pulling
     assert {m["id"] for m in cfg["models"].values() if m["provider"] == "openrouter" and m.get("kind", "chat") == "chat"} == {
-        "google/gemma-4-31b-it", "google/gemma-4-26b-a4b-it"}
+        "google/gemma-4-31b-it", "google/gemma-4-26b-a4b-it", "xingchen-agi/xing4.0-29b-a4b:free", "poolside/laguna-s-2.1:free"}
     assert {m["id"] for m in cfg["models"].values() if m["provider"] == "openrouter" and m.get("kind") == "decision"} == {
         "typesafe/jev-1.13", "inception/mercury-decide:free"}
     assert cfg["roles"]["decisions"]["chain"] == ["jev", "jev_or", "mercury_decide", "gemma_26b"]

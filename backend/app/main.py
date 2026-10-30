@@ -33,7 +33,7 @@ from .db import Store
 from .engine import Engine, UserError
 from .resilience import mask_key
 from .router import ModelRouter
-from .settings import ROOT, get_db_path, get_uploads_dir, validate_and_prepare_paths
+from .settings import ROOT, drop_empty_env, get_db_path, get_uploads_dir, validate_and_prepare_paths
 from .tools import ToolRunner
 from . import visuals, web
 from .visuals.cover import cover_svg
@@ -101,6 +101,7 @@ class ChaosIn(BaseModel):
 
 def create_app(db_path: Optional[str] = None, provider_override=None, self_test_on_start: Optional[bool] = None,
                start_worker: bool = True, upload_dir: Optional[str] = None) -> FastAPI:
+    drop_empty_env()
     load_env()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     resolved_db = get_db_path(db_path)

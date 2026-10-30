@@ -36,6 +36,9 @@ models:
   gemma_26b:     { provider: gemini_api, kind: chat, id: gemma-4-26b-a4b-it, thinking_level: minimal }  # fast: bulk writing
   or_gemma_31b:  { provider: openrouter, kind: chat, id: google/gemma-4-31b-it }
   or_gemma_26b:  { provider: openrouter, kind: chat, id: google/gemma-4-26b-a4b-it }
+  gemini_flash:  { provider: gemini_api, kind: chat, id: gemini-3.8-flash, thinking_level: minimal }   # resource pulling, tool use, long context (AI Studio free tier)
+  or_xing:       { provider: openrouter, kind: chat, id: "xingchen-agi/xing4.0-29b-a4b:free" }       # free; planning + tool calling; Gemini quota fallback
+  or_laguna:     { provider: openrouter, kind: chat, id: "poolside/laguna-s-2.1:free" }              # free; coding-tuned, for code-heavy chapters
   sarvam_gemma4: { provider: sarvam,     kind: chat, id: gemma4 }                # Gemma 4 31B on Sarvam (beta), image capable
   sarvam_105b:   { provider: sarvam,     kind: chat, id: sarvam-105b }           # Indian-language reasoning
   # Decision models: typed answers (choice, score, yes/no probability), never generated text. Chain: see roles.decisions.
@@ -51,13 +54,13 @@ models:
 
 roles:
   intake:        { chain: [gemma_31b, gemma_26b, or_gemma_31b, sarvam_gemma4, text_only], timeout_s: 45 }
-  architect:     { chain: [gemma_31b, gemma_26b, or_gemma_31b, sarvam_gemma4, linear_path], timeout_s: 45 }
-  curator:       { chain: [gemma_26b, or_gemma_26b, search_order], timeout_s: 20 }   # Gemma relevance list when every decision provider failed
-  teacher:       { chain: [gemma_26b, gemma_31b, or_gemma_26b, sarvam_gemma4, cached_lesson], timeout_s: 45 }
+  architect:     { chain: [gemma_31b, gemma_26b, or_gemma_31b, or_xing, sarvam_gemma4, linear_path], timeout_s: 45 }
+  curator:       { chain: [gemini_flash, gemma_26b, or_xing, or_gemma_26b, search_order], timeout_s: 20 }   # Gemma relevance list when every decision provider failed
+  teacher:       { chain: [gemma_26b, gemma_31b, or_gemma_26b, or_laguna, gemini_flash, sarvam_gemma4, cached_lesson], timeout_s: 45 }
   teacher_indic: { chain: [sarvam_105b, gemma_31b, cached_lesson] }
   slides:        { chain: [gemma_26b, gemma_31b, or_gemma_26b, cached_lesson], timeout_s: 45 }   # the slide deck, written after the notes are final
   critic:        { chain: [gemma_31b, gemma_26b, or_gemma_31b, sarvam_gemma4, rule_checks], timeout_s: 40 }
-  quizzer:       { chain: [gemma_26b, gemma_31b, or_gemma_26b, cached_questions] }
+  quizzer:       { chain: [gemma_26b, gemma_31b, or_gemma_26b, or_laguna, cached_questions] }
   # Fills small JSON diagram specs (code draws the SVG). deterministic_only = no spec, the chapter simply ships without that visual.
   editor:        { chain: [gemma_31b, gemma_26b, or_gemma_31b, sarvam_gemma4, no_change], timeout_s: 40 }   # proposes course edits; code validates every operation
   ocr:           { chain: [gemma_31b, gemma_26b, or_gemma_31b, text_only], timeout_s: 45 }   # vision transcription of pages with no text layer

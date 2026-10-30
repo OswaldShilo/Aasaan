@@ -4,7 +4,6 @@
 
 - Python 3.12 (the version the project is developed and tested on)
 - One Gemini key from Google AI Studio (`GEMINI_API_KEY`). Without any model key the app starts but refuses to build notebooks, and shows a banner. There is no demo mode.
-- Docker only if you want the container or the optional offline OCR.
 
 ## 1. Install
 
@@ -60,25 +59,6 @@ Tests never call a real model or the real network: they use a test double (`back
 Three integration tests need the real Indra OCR engine and are skipped unless it is installed (see below).
 
 With the server running, `python scripts/acceptance.py` runs the end-to-end acceptance checks against it.
-
-## Optional: offline OCR (Indra)
-
-Indra reads scanned pages on the CPU with no network. It runs on Linux and macOS, so on Windows use Docker.
-
-```bash
-docker build -t aasaan .                            # installs indra-ocr and bakes the models in
-docker build --build-arg WITH_INDRA=0 -t aasaan .   # build without it
-```
-
-The spike that compared it with the current path is in `eval/indra/README.md` and `eval/indra/REPORT.md`.
-
-## Optional: Docker
-
-```bash
-docker compose up -d --build        # app + Caddy (automatic HTTPS) + nightly SQLite backup
-```
-
-Needs a filled `.env` and a domain. Full steps, backups and Azure Container Apps notes: [DEPLOY.md](DEPLOY.md). SQLite means exactly one app instance.
 
 ## Switches you may want
 

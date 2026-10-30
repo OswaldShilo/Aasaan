@@ -46,7 +46,6 @@ Aasaan is plain Python and plain JavaScript on a small set of open-source parts.
 | [Indra OCR](https://github.com/datalab-to/indra) (optional, in Docker) | fast offline OCR for scans | code Apache-2.0; model weights under a modified OpenRAIL-M licence |
 | [Gemma 4](https://ai.google.dev/gemma) | the main writing, checking and vision models (open weights) | Gemma terms of use |
 | [pytest](https://github.com/pytest-dev/pytest) | the test suite | MIT |
-| [Caddy](https://github.com/caddyserver/caddy), [Docker](https://www.docker.com) | HTTPS and deployment | Apache-2.0 |
 | [Newsreader](https://github.com/productiontype/Newsreader), [Hanken Grotesk](https://github.com/marcologous/hanken-grotesk) | fonts | SIL OFL |
 
 The frontend has no framework and no build step (`frontend/`).
@@ -64,6 +63,7 @@ No accounts. A random learner id lives in the browser; memory (mistake labels, p
 - [HOW_TO_RUN.md](HOW_TO_RUN.md): install, configure, run, test, Docker
 - [DEPLOY.md](DEPLOY.md): one small server with HTTPS, backups and Azure Container Apps notes
 - [AZURE_DEPLOYMENT_README.md](AZURE_DEPLOYMENT_README.md): Azure Container Apps architecture, SQLite EmptyDir pattern, and GitHub CI/CD deployment guide
+- [HOW_TO_RUN.md](HOW_TO_RUN.md): install, configure, run, test
 - [build-log/](build-log/): what was built, milestone by milestone, and the Milestone 4 checklist
 - [eval/](eval/): quality baseline and the Indra OCR spike report
 - `PRD.md`, `agents/`, `architecture/`: the original planning documents, kept for reference

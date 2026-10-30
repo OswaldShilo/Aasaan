@@ -1,17 +1,28 @@
-# Caddy gets and renews HTTPS certificates automatically for AASAAN_DOMAIN.
-# With AASAAN_DOMAIN unset (local testing) it serves https://localhost with Caddy's local certificate.
+# Caddy gets and renews the HTTPS certificate for AASAAN_DOMAIN automatically (ports 80 and 443 must be open).
+# With AASAAN_DOMAIN unset (local testing) it serves https://localhost with Caddy's own local certificate.
 {$AASAAN_DOMAIN:localhost} {
-	encode gzip zstd
-
-	header {
-		X-Content-Type-Options nosniff
-		Referrer-Policy strict-origin-when-cross-origin
-		X-Frame-Options SAMEORIGIN
-		-Server
+	# Compress only text-like responses. Server-sent events (text/event-stream) are deliberately not listed, so they are never buffered.
+	encode {
+		zstd
+		gzip
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/javascript*
+			header Content-Type application/javascript*
+			header Content-Type application/json*
+			header Content-Type image/svg+xml*
+		}
 	}
 
-	# flush_interval -1 keeps server-sent events (live chapter updates) flowing without buffering
+	header -Server
+
+	# The app sets its own security headers. flush_interval -1 sends each SSE event to the browser immediately.
 	reverse_proxy app:8000 {
 		flush_interval -1
+		transport http {
+			response_header_timeout 0
+			dial_timeout 5s
+		}
 	}
 }

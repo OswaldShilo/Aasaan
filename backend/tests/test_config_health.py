@@ -183,3 +183,20 @@ def test_aca_style_paths_configuration(tmp_path, monkeypatch):
         assert client.get("/health/ready").status_code == 200
         assert aca_db.exists()
         assert aca_uploads.is_dir()
+
+
+def test_blank_settings_are_treated_as_unset(monkeypatch):
+    """`docker compose` env_file hands over every blank line of .env.example as ''; int('') used to crash startup."""
+    from app.settings import drop_empty_env
+    from app.main import create_app
+    monkeypatch.setenv("AASAAN_CHAPTER_CONCURRENCY", "")
+    monkeypatch.setenv("AASAAN_NB_PER_HOUR", "  ")
+    monkeypatch.setenv("OPENVERSE_CLIENT_ID", "")
+    monkeypatch.setenv("AASAAN_SSE_MAX_SECONDS", "150")
+    monkeypatch.setenv("PYTHONWARNINGS", "")
+    dropped = drop_empty_env()
+    assert {"AASAAN_CHAPTER_CONCURRENCY", "AASAAN_NB_PER_HOUR", "OPENVERSE_CLIENT_ID"} <= set(dropped) and "PYTHONWARNINGS" not in dropped
+    import os
+    assert "AASAAN_CHAPTER_CONCURRENCY" not in os.environ and os.environ["AASAAN_SSE_MAX_SECONDS"] == "150"
+    monkeypatch.setenv("AASAAN_CHAPTER_CONCURRENCY", "")
+    create_app(db_path=":memory:", self_test_on_start=False, start_worker=False)      # used to raise ValueError
